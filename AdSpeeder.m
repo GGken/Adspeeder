@@ -556,13 +556,18 @@ static NSString *const kBoostJS =
 // 小程序/小游戏里的激励视频走 my.createRewardedAd，奖励判定在 JS 的 onClose(isEnded)。
 // 原生把视频跳完并不能让它认为"看完了"，所以这里在 JS 层接管这个 API：
 //   1) 记下游戏注册的 onClose 回调
-//   2) window.__asFakeAd 为真时，show() 之后直接回 isEnded=true，原生广告根本不播
+//   2) 直通开着时，show() 直接回 isEnded=true，原生广告根本不播
+//
+// 开关值 __AS_FAKE__ 在"注入那一刻"由原生替换成 1/0（见 ASShimJS），
+// 不再依赖 window.__asFakeAd —— 实测游戏页会把 window 上的自定义属性弄丢
+// （日志里 shim 装好 fake=1、到 show() 却变成 fake=0），写死在源码里最稳。
 static NSString *const kAdShimJS =
 @"(function(){"
  "if(window.__asAdShim)return;window.__asAdShim=1;"
+ "var FAKE=__AS_FAKE__;"
  "function log(m){try{window.webkit.messageHandlers.aslog.postMessage('[JS] '+m);}catch(e){}}"
  "var U='';try{U=String(location.href).slice(0,70);}catch(e){}"
- "log('shim 装好 fake='+(window.__asFakeAd?1:0)+' '+U);"
+ "log('shim 装好 fake='+FAKE+' '+U);"
  "window.__asFireAdClose=function(){var cb=window.__asAdCloseCb;if(!cb)return 'no-cb';"
  "if(window.__asAdFired)return 'already';window.__asAdFired=1;"
  "try{cb({isEnded:true,count:1,completed:true,reward:true});}catch(e){return 'err:'+e;}return 'ok';};"
@@ -583,7 +588,7 @@ static NSString *const kAdShimJS =
  "try{cb&&cb(out);}catch(e){log('cb 抛错 '+e);}};"
  "return oc.call(ad,w);};}catch(e){log('onClose 接管失败 '+e);}"
  "var os=null;try{os=ad.show;}catch(e){}"
- "try{ad.show=function(){window.__asAdFired=0;var fake=!!window.__asFakeAd;"
+ "try{ad.show=function(){window.__asAdFired=0;var fake=(FAKE===1);"
  "log('show() fake='+(fake?1:0)+' ('+src+')');"
  "if(fake){var tries=0;(function fire(){var cb=window.__asAdCloseCb;"
  "if(!cb&&++tries<20){setTimeout(fire,300);return;}"
@@ -609,6 +614,12 @@ static NSString *const kAdShimJS =
  "if(n===0){if(++tries<40)setTimeout(scan,250);"
  "else log('没找到广告 API（my='+(typeof window.my)+'）');}}"
  "scan();})();";
+
+// 每次注入都把当前开关值写死进源码
+static NSString *ASShimJS(void) {
+    return [kAdShimJS stringByReplacingOccurrencesOfString:@"__AS_FAKE__"
+                                                 withString:(gFakeAd ? @"1" : @"0")];
+}
 
 static IMP gOrigInitWithFrameConfig = NULL;
 
@@ -636,12 +647,14 @@ static void ASPushFakeAdToWebViews(void) {
     for (WKWebView *w in snapshot) {
         @try {
             [w evaluateJavaScript:js completionHandler:nil];
-            // 页面可能比 dylib 更早加载（那时 shim 还没注入），这里补一次；脚本本身幂等
-            [w evaluateJavaScript:kAdShimJS completionHandler:nil];
+            // 开关值写死在脚本里，所以改开关后要让它重新装一遍（先清标记再注入）
+            [w evaluateJavaScript:@"window.__asAdShim=0;window.__asAdFired=0;"
+                completionHandler:nil];
+            [w evaluateJavaScript:ASShimJS() completionHandler:nil];
             ok++;
         } @catch (__unused NSException *e) {}
     }
-    ASRecord([NSString stringWithFormat:@"直通=%@，已推送到 %d/%lu 个 WebView",
+    ASRecord([NSString stringWithFormat:@"直通=%@，已推送到 %d/%lu 个 WebView（开关切换后建议重开游戏）",
               gFakeAd ? @"开" : @"关", ok, (unsigned long)snapshot.count]);
 }
 
@@ -665,7 +678,7 @@ static void ASAdoptWebView(WKWebView *wv) {
             NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;window.__asFakeAd=%@;",
                               gRate, gFakeAd ? @"true" : @"false"];
             [wv evaluateJavaScript:seed completionHandler:nil];
-            [wv evaluateJavaScript:kAdShimJS completionHandler:nil];
+            [wv evaluateJavaScript:ASShimJS() completionHandler:nil];
             [wv evaluateJavaScript:kBoostJS completionHandler:nil];
         } @catch (__unused NSException *e) {}
         ASPushRateToWebView(wv);
@@ -689,7 +702,7 @@ static id ASMyInitWithFrameConfig(WKWebView *self, SEL _cmd, CGRect frame, WKWeb
         [ucc addUserScript:[[WKUserScript alloc] initWithSource:seed
                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                                  forMainFrameOnly:NO]];
-        [ucc addUserScript:[[WKUserScript alloc] initWithSource:kAdShimJS
+        [ucc addUserScript:[[WKUserScript alloc] initWithSource:ASShimJS()
                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                                  forMainFrameOnly:NO]];
         [ucc addUserScript:[[WKUserScript alloc] initWithSource:kBoostJS
@@ -2458,7 +2471,7 @@ static void AdSpeederInit(void) {
         [[NSRunLoop mainRunLoop] addTimer:fast forMode:NSRunLoopCommonModes];
     }
 
-    NSLog(@"[AdSpeeder] v10 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, makeVisible=%d, rate=%gx, autoSkip=%d, instant=%d)",
+    NSLog(@"[AdSpeeder] v11 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, makeVisible=%d, rate=%gx, autoSkip=%d, instant=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
           gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL,
