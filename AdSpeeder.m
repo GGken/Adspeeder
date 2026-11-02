@@ -1,5 +1,22 @@
-// AdSpeeder v7 - Alipay mini-game rewarded-video ad accelerator
+// AdSpeeder v9 - Alipay mini-game rewarded-video ad accelerator
 // 纯 objc runtime swizzling，不带 substrate / logos 依赖，TrollFools 注入可加载。
+//
+// v9：截图证实这是"激励浏览"广告（浏览14秒得奖励）——没有视频、只有一条停留计时，
+//      所以倍速和跳片尾都碰不到它。改从"关广告 + 改结果"两头夹：
+//   1. ASAutoCloseDwellAd：直通模式下找到"关闭"按钮并点掉（同窗口只点一次，广告撤了会重置）
+//   2. 点完 1.2s 从 JS 补一发 __asFireAdClose()，让游戏认为"看完了"
+//   3. onClose 改写成通杀：原生真回调进来也强制 isEnded=true（只改这一层，游戏逻辑不动）
+//   4. JS 补发了防重（__asAdFired），避免二次发奖/逻辑错乱
+//   5. 每个页面装 shim 时打印 fake=? 和 URL，能立刻看出开关有没有推进那个 WebView
+//
+// v8：日志证明 JS 接管成功、倍速真的生效（2.00x）、跳片尾也生效，但
+//      "顶部倒计时"还在走，奖励卡在那条独立计时上。
+//   1. gAdSeenAt 改由"BEE 播放器在屏"触发（之前只认 Ad* 类名，这条链上没有）——
+//      NSTimer 压缩终于有机会生效；窗口 6s→15s、interval 0.2~5s
+//   2. 新增倒计时文案扫描：把"12 秒 / 跳过 5"这类 UILabel 的宿主类名记下来，
+//      有它就说明倒计时是原生的（可按宿主类精准 hook），没有就是 H5 画的
+//   3. 弹窗文案改从实例读 title/message（swizzle 工厂方法没抓到）
+//   4. JS 直通改成"等 onClose 注册了再回"，先 show 后注册的游戏也能吃到
 //
 // v7：日志证明"跳片尾"确实生效（广告 1.5s 内就关），但奖励可能仍被 JS 侧判定为未完成
 //   1. JS 层接管 my.createRewardedAd：记录 onClose 回调，可直通 isEnded=true（菜单开关）
@@ -83,6 +100,8 @@ static int  ASForceSkipNow(NSMutableString *detail);
 static void ASDriveBeePlayers(void);
 static NSString *ASProbeBeePlayer(id p);
 static double ASBeePlayerDuration(id p);
+static void ASFireJsAdClose(void);
+static int  ASAutoCloseDwellAd(void);
 
 static BOOL ASIsAlipay(void) {
     static BOOL result = NO;
@@ -520,6 +539,11 @@ static NSString *const kAdShimJS =
 @"(function(){"
  "if(window.__asAdShim)return;window.__asAdShim=1;"
  "function log(m){try{window.webkit.messageHandlers.aslog.postMessage('[JS] '+m);}catch(e){}}"
+ "var U='';try{U=String(location.href).slice(0,70);}catch(e){}"
+ "log('shim 装好 fake='+(window.__asFakeAd?1:0)+' '+U);"
+ "window.__asFireAdClose=function(){var cb=window.__asAdCloseCb;if(!cb)return 'no-cb';"
+ "if(window.__asAdFired)return 'already';window.__asAdFired=1;"
+ "try{cb({isEnded:true,count:1,completed:true,reward:true});}catch(e){return 'err:'+e;}return 'ok';};"
  "function targets(){var a=[];try{if(window.my)a.push(window.my);}catch(e){}"
  "try{if(window.antgame){a.push(window.antgame);if(window.antgame.ad)a.push(window.antgame.ad);"
  "if(window.antgame.my)a.push(window.antgame.my);}}catch(e){}"
@@ -528,12 +552,22 @@ static NSString *const kAdShimJS =
  "function hook(ad,src){if(!ad)return;var k='__asHooked';try{if(ad[k])return;ad[k]=1;}catch(e){return;}"
  "var oc=null;try{oc=ad.onClose;}catch(e){}"
  "try{ad.onClose=function(cb){window.__asAdCloseCb=cb;log('onClose 注册('+src+')');"
- "return oc?oc.call(ad,cb):undefined;};}catch(e){log('onClose 接管失败 '+e);}"
+ "if(!oc)return;"
+ "var w=function(res){if(window.__asAdFired)return;window.__asAdFired=1;"
+ "var out={isEnded:true,count:1,completed:true,reward:true};"
+ "try{if(res&&typeof res==='object'){for(var kk in res)out[kk]=res[kk];}out.isEnded=true;out.count=1;"
+ "if(out.completed===false)out.completed=true;}catch(e){}"
+ "log('原生 onClose 被改写 isEnded=true');"
+ "try{cb&&cb(out);}catch(e){log('cb 抛错 '+e);}};"
+ "return oc.call(ad,w);};}catch(e){log('onClose 接管失败 '+e);}"
  "var os=null;try{os=ad.show;}catch(e){}"
- "try{ad.show=function(){var fake=!!window.__asFakeAd;log('show() fake='+(fake?1:0)+' ('+src+')');"
- "if(fake){setTimeout(function(){var cb=window.__asAdCloseCb;"
+ "try{ad.show=function(){window.__asAdFired=0;var fake=!!window.__asFakeAd;"
+ "log('show() fake='+(fake?1:0)+' ('+src+')');"
+ "if(fake){var tries=0;(function fire(){var cb=window.__asAdCloseCb;"
+ "if(!cb&&++tries<20){setTimeout(fire,300);return;}"
+ "if(window.__asAdFired)return;window.__asAdFired=1;"
  "log('直接回 onClose isEnded=true cb='+(cb?'有':'无'));"
- "try{if(cb)cb({isEnded:true,count:1,completed:true,reward:true});}catch(e){log('cb 抛错 '+e);}},800);"
+ "try{if(cb)cb({isEnded:true,count:1,completed:true,reward:true});}catch(e){log('cb 抛错 '+e);}})();"
  "try{return Promise.resolve();}catch(e){return;}}"
  "return os?os.apply(ad,arguments):undefined;};}catch(e){log('show 接管失败 '+e);}"
  "var ol=null;try{ol=ad.load;}catch(e){}"
@@ -576,9 +610,17 @@ static void ASPushFakeAdToWebViews(void) {
     NSArray *snapshot = nil;
     @synchronized (gWebViews) { snapshot = gWebViews.allObjects; }
     NSString *js = [NSString stringWithFormat:@"window.__asFakeAd=%@;", gFakeAd ? @"true" : @"false"];
+    int ok = 0;
     for (WKWebView *w in snapshot) {
-        @try { [w evaluateJavaScript:js completionHandler:nil]; } @catch (__unused NSException *e) {}
+        @try {
+            [w evaluateJavaScript:js completionHandler:nil];
+            // 页面可能比 dylib 更早加载（那时 shim 还没注入），这里补一次；脚本本身幂等
+            [w evaluateJavaScript:kAdShimJS completionHandler:nil];
+            ok++;
+        } @catch (__unused NSException *e) {}
     }
+    ASRecord([NSString stringWithFormat:@"直通=%@，已推送到 %d/%lu 个 WebView",
+              gFakeAd ? @"开" : @"关", ok, (unsigned long)snapshot.count]);
 }
 
 static void ASPushRateToWebView(WKWebView *webView) {
@@ -645,6 +687,12 @@ static void ASMyPresent(UIViewController *self, SEL _cmd, UIViewController *vc, 
     @try {
         ASRecord([NSString stringWithFormat:@"弹窗: %@ → %@",
                   NSStringFromClass([self class]), NSStringFromClass([vc class])]);
+        // 从实例上直接读文案，比 swizzle 工厂方法可靠（类和子类都可能建 alert）
+        if ([vc isKindOfClass:[UIAlertController class]]) {
+            UIAlertController *ac = (UIAlertController *)vc;
+            ASRecord([NSString stringWithFormat:@"[弹窗文案] %@ | %@",
+                      ac.title.length ? ac.title : @"(无标题)", ac.message ?: @""]);
+        }
     } @catch (__unused NSException *e) {}
     ((void (*)(id, SEL, id, BOOL, id))gOrigPresent)(self, _cmd, vc, animated, completion);
 }
@@ -818,6 +866,9 @@ static void ASScanOnce(void) {
 
     // 小程序视频组件（BeeVideoPlayerView）这条路单独驱动
     @try { ASDriveBeePlayers(); } @catch (__unused NSException *e) {}
+
+    // 激励浏览型广告没有播放器，单独处理
+    @try { ASAutoCloseDwellAd(); } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - 广告倒计时压缩
@@ -829,8 +880,8 @@ static NSTimeInterval ASCompressInterval(NSTimeInterval ti, BOOL repeats) {
     if (!ASEngineOn() || !repeats) return ti;
     if (gAdSeenAt <= 0) return ti;
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (now - gAdSeenAt > 6.0) return ti;
-    if (ti < 0.5 || ti > 3.0) return ti;
+    if (now - gAdSeenAt > 15.0) return ti;
+    if (ti < 0.2 || ti > 5.0) return ti;
     float div = gRate / 2.0f;
     if (div < 2.0f) div = 2.0f;
     if (div > 10.0f) div = 10.0f;
@@ -1381,6 +1432,128 @@ static double ASBeePlayerDuration(id p) {
     return 0;
 }
 
+// 屏幕上"像倒计时"的文案 + 它的宿主类名。
+// 找到原生 UILabel → 可以按宿主类写精准 hook；一条都找不到 → 说明倒计时是 H5 画的，
+// 原生这边再怎么改都没用，只能回到 JS 路线。
+static NSMutableSet<NSString *> *gSeenCountdowns = nil;
+static NSTimeInterval gLastCountdownScan = 0;
+
+static BOOL ASLooksLikeCountdownText(NSString *t, UIView *host) {
+    if (!t.length || t.length > 12) return NO;
+    BOOL hasDigit = NO;
+    for (NSUInteger i = 0; i < t.length; i++) {
+        unichar c = [t characterAtIndex:i];
+        if (c >= '0' && c <= '9') { hasDigit = YES; break; }
+    }
+    if (!hasDigit) return NO;
+    if ([t containsString:@"秒"] || [t.lowercaseString containsString:@"s"]) return YES;
+
+    NSString *chain = ASClassChain([host class]).lowercaseString;
+    NSArray *kw = @[@"count", @"timer", @"skip", @"reward", @"clock", @"progress"];
+    for (NSString *k in kw) if ([chain containsString:k]) return YES;
+    return NO;
+}
+
+static void ASScanCountdownUI(void) {
+    if (!gSeenCountdowns) gSeenCountdowns = [NSMutableSet set];
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gLastCountdownScan < 1.0) return;
+    gLastCountdownScan = now;
+    if (gSeenCountdowns.count > 24) return;
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            NSString *text = nil;
+            if ([v isKindOfClass:[UILabel class]]) {
+                text = ((UILabel *)v).text;
+            } else if ([v isKindOfClass:[UIButton class]]) {
+                text = [(UIButton *)v titleForState:UIControlStateNormal];
+            }
+            if (!text.length) return;
+            UIView *host = v.superview ?: v;
+            if (!ASLooksLikeCountdownText(text, host)) return;
+
+            NSString *desc = [NSString stringWithFormat:@"%@ \"%@\" 宿主 %@",
+                              NSStringFromClass([v class]), text,
+                              NSStringFromClass([host class])];
+            if ([gSeenCountdowns containsObject:desc]) return;
+            [gSeenCountdowns addObject:desc];
+            ASRecord([NSString stringWithFormat:@"倒计时UI: %@", desc]);
+        });
+    }
+}
+
+// ---- 激励浏览广告（"浏览14秒得奖励"）------------------------------------
+// 这种广告没有视频、没有播放器，只有一条停留计时 + 一个关闭按钮。
+// 直通模式下：点掉它的关闭按钮，再从 JS 层补一发 onClose(isEnded=true)。
+
+static void ASFireJsAdClose(void) {
+    NSArray *snapshot = nil;
+    @synchronized (gWebViews) { snapshot = gWebViews.allObjects; }
+    for (WKWebView *w in snapshot) {
+        @try {
+            [w evaluateJavaScript:@"(window.__asFireAdClose?window.__asFireAdClose():'no-fn')"
+                 completionHandler:^(id r, NSError *e) {
+                if (r) ASRecord([NSString stringWithFormat:@"JS 补发 onClose → %@", r]);
+            }];
+        } @catch (__unused NSException *e) {}
+    }
+}
+
+static NSMutableSet<NSString *> *gDwellHandled = nil;
+static NSTimeInterval gLastDwellAction = 0;
+static BOOL gForceClose = NO;          // 菜单里手点"秒关"时为真，忽略直通开关
+
+static int ASAutoCloseDwellAd(void) {
+    if (!ASIsAlipay()) return 0;
+    if (!gFakeAd && !gForceClose) return 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gLastDwellAction < 2.0) return 0;
+    if (!gDwellHandled) gDwellHandled = [NSMutableSet set];
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        NSString *key = [NSString stringWithFormat:@"%p", (__bridge void *)w];
+        if ([gDwellHandled containsObject:key]) continue;
+
+        __block BOOL dwell = NO;
+        NSMutableArray<UIButton *> *btns = [NSMutableArray array];
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if ([v isKindOfClass:[UILabel class]]) {
+                NSString *t = ((UILabel *)v).text;
+                if (t.length && ([t containsString:@"得奖励"] || [t containsString:@"浏览"])) dwell = YES;
+            } else if ([v isKindOfClass:[UIButton class]]) {
+                [btns addObject:(UIButton *)v];
+            }
+        });
+        if (!dwell) { [gDwellHandled removeObject:key]; continue; }
+
+        [gDwellHandled addObject:key];
+        UIButton *target = nil;
+        for (UIButton *b in btns) {
+            if (b.hidden || b.alpha < 0.01) continue;
+            NSString *t = [b titleForState:UIControlStateNormal] ?: @"";
+            if ([t containsString:@"关闭"] || [t isEqualToString:@"×"] || [t isEqualToString:@"X"]) {
+                target = b;
+                break;
+            }
+        }
+        if (!target) {
+            ASRecord(@"浏览型广告：找到计时文案，但没有可点的关闭按钮");
+            return 0;
+        }
+        gLastDwellAction = now;
+        ASRecord([NSString stringWithFormat:@"浏览型广告：点关闭（%@）",
+                  [target titleForState:UIControlStateNormal] ?: @"?"]);
+        [target sendActionsForControlEvents:UIControlEventTouchUpInside];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ ASFireJsAdClose(); });
+        return 1;
+    }
+    return 0;
+}
+
 static void ASDriveBeePlayers(void) {
     if (!ASEngineOn()) return;
     if (!gAdFirstSeen) gAdFirstSeen = [NSMutableDictionary dictionary];
@@ -1396,6 +1569,12 @@ static void ASDriveBeePlayers(void) {
         });
     }
     if (players.count == 0) return;
+
+    // 播放器在屏 = 广告正在播；把"广告窗口"打开，NSTimer 压缩才会真正生效
+    // （v7 之前这个时间戳只由 Ad* 视图名触发，而这条链上根本没有 Ad* 类）
+    gAdSeenAt = [NSDate timeIntervalSinceReferenceDate];
+
+    @try { ASScanCountdownUI(); } @catch (__unused NSException *e) {}
 
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
 
@@ -1487,7 +1666,7 @@ static void ASDriveBeePlayers(void) {
 
 static NSString *ASBuildInterfaceReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"AdSpeeder 诊断 v7\n倍速: %gx (%@)   自动秒过: %@   跳片尾: %@   直通: %@   通用hook: %lu   计时器压缩: %d\n\n",
+    [out appendFormat:@"AdSpeeder 诊断 v9\n倍速: %gx (%@)   自动秒过: %@   跳片尾: %@   直通: %@   通用hook: %lu   计时器压缩: %d\n\n",
      gRate, ASEngineOn() ? @"开" : @"关", gAutoSkip ? @"开" : @"关",
      gSeekToEnd ? @"开" : @"关", gFakeAd ? @"开" : @"关",
      (unsigned long)gGenHooked.count, gTimerHits];
@@ -1823,6 +2002,16 @@ static void ASSetRate(float rate, BOOL persist) {
         ASRecord([NSString stringWithFormat:@"JS 直通广告回调 %@（下次点广告生效）", gFakeAd ? @"开" : @"关"]);
     }]];
 
+    [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ 秒关当前广告" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        gLastDwellAction = 0;
+        if (gDwellHandled) [gDwellHandled removeAllObjects];
+        gForceClose = YES;
+        int hit = ASAutoCloseDwellAd();
+        gForceClose = NO;
+        ASFireJsAdClose();
+        ASRecord([NSString stringWithFormat:@"手动秒关：%@", hit ? @"已点关闭" : @"没找到广告容器"]);
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ 秒过当前广告" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSMutableString *detail = [NSMutableString string];
         (void)ASForceSkipNow(detail);
@@ -1981,7 +2170,7 @@ static void AdSpeederInit(void) {
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v7 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
+    NSLog(@"[AdSpeeder] v9 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
           gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
