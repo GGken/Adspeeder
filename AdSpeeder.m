@@ -781,7 +781,9 @@ static void ASMyMakeVisible(UIWindow *self, SEL _cmd) {
     ((void (*)(id, SEL))gOrigMakeVisible)(self, _cmd);
 }
 
-#pragma mark - 广告巡检（自动抓，不用卡时间）static NSString *ASSnapshotOfView(UIView *v) {
+#pragma mark - 广告巡检（自动抓，不用卡时间）
+
+static NSString *ASSnapshotOfView(UIView *v) {
     NSMutableString *s = [NSMutableString string];
     Class cls = [v class];
     [s appendFormat:@"%@  frame=%@\n", NSStringFromClass(cls), NSStringFromCGRect(v.frame)];
