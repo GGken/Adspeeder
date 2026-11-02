@@ -2,8 +2,8 @@
 // No substrate / logos dependency: pure objc runtime swizzling, so the dylib
 // loads fine inside a TrollFools-injected (non-jailbroken) Alipay process.
 //
-// 悬浮球：单击循环倍速（关 / 2x / 4x / 8x / 16x / 32x），长按弹出选单，
-//         拖动可换位置，设置与坐标都会持久化。
+// 悬浮球：单击循环倍速（关 / 2x / 4x / 8x / 16x / 32x），长按弹出选单
+//         （含"抓取当前界面"诊断），拖动换位置，设置与坐标持久化。
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
@@ -21,9 +21,10 @@ static NSString *const kPrefRate    = @"adspeeder.rate";
 static NSString *const kPrefPosX    = @"adspeeder.x";
 static NSString *const kPrefPosY    = @"adspeeder.y";
 
-// 0 = 关闭
-static float gRate = 16.0f;
+static float gRate = 16.0f;                    // 0 = 关闭
 static NSHashTable<WKWebView *> *gWebViews = nil;
+static NSHashTable<AVPlayer *> *gPlayers  = nil;
+static NSMutableArray<NSString *> *gEvents = nil;
 
 #pragma mark - 基础
 
@@ -37,7 +38,6 @@ static BOOL ASIsAlipay(void) {
     return result;
 }
 
-// 只改本类自己的方法，避免污染父类实现
 static BOOL ASSwizzle(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return NO;
@@ -49,12 +49,30 @@ static BOOL ASSwizzle(Class cls, SEL sel, IMP newImp, IMP *outOrig) {
 
 static BOOL ASEngineOn(void) { return gRate > 1.0f; }
 
+#pragma mark - 事件记录（给用户看的诊断缓冲）
+
+static void ASRecord(NSString *line) {
+    if (!line) return;
+    static NSDateFormatter *fmt = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+    NSString *stamp = [fmt stringFromDate:[NSDate date]];
+    if (!gEvents) gEvents = [NSMutableArray array];
+    @synchronized (gEvents) {
+        [gEvents addObject:[NSString stringWithFormat:@"%@  %@", stamp, line]];
+        if (gEvents.count > 300) [gEvents removeObjectAtIndex:0];
+    }
+}
+
 #pragma mark - 设置
 
 static void ASLoadPrefs(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     if ([d objectForKey:kPrefEnabled] == nil) {
-        gRate = 16.0f;              // 首次安装默认开启 16 倍
+        gRate = 16.0f;
         [d setBool:YES forKey:kPrefEnabled];
         [d setFloat:gRate forKey:kPrefRate];
     } else {
@@ -83,9 +101,10 @@ static void ASPushRateToAllWebViews(void) {
 #pragma mark - AVPlayer 路径
 
 static IMP gOrigSetRate = NULL;
-static IMP gOrigPlay    = NULL;
+static IMP gOrigPlay = NULL;
+static IMP gOrigPlayAtRate = NULL;
+static IMP gOrigSetRateTime = NULL;
 
-// 判断当前播放项像不像广告：时长短 + 支持快进
 static float ASAdRateForPlayer(AVPlayer *player) {
     if (!ASEngineOn()) return 0.0f;
     AVPlayerItem *item = player.currentItem;
@@ -96,11 +115,18 @@ static float ASAdRateForPlayer(AVPlayer *player) {
     return gRate;
 }
 
+static void ASRegisterPlayer(AVPlayer *p) {
+    if (!p || !gPlayers) return;
+    @synchronized (gPlayers) { [gPlayers addObject:p]; }
+}
+
 static void ASMySetRate(AVPlayer *self, SEL _cmd, float rate) {
+    ASRegisterPlayer(self);
     if (rate > 0.0f) {
         float target = ASAdRateForPlayer(self);
         if (target > rate) {
             Float64 d = CMTimeGetSeconds(self.currentItem.duration);
+            ASRecord([NSString stringWithFormat:@"AVPlayer 广告命中 %.0fx (时长 %.1fs)", target, d]);
             NSLog(@"[AdSpeeder] ad detected at %.0fx (duration=%.1fs)", target, d);
             rate = target;
             self.muted = YES;
@@ -110,12 +136,60 @@ static void ASMySetRate(AVPlayer *self, SEL _cmd, float rate) {
 }
 
 static void ASMyPlay(AVPlayer *self, SEL _cmd) {
+    ASRegisterPlayer(self);
     ((void (*)(id, SEL))gOrigPlay)(self, _cmd);
     float target = ASAdRateForPlayer(self);
     if (target > 1.0f) {
         self.muted = YES;
-        self.rate = target;   // 走 swizzle 后的 setRate:
+        self.rate = target;
     }
+}
+
+static void ASMyPlayAtRate(AVPlayer *self, SEL _cmd, float rate) {
+    ASRegisterPlayer(self);
+    float target = ASAdRateForPlayer(self);
+    if (target > rate) {
+        ASRecord([NSString stringWithFormat:@"AVPlayer(playImmediately) 广告命中 %.0fx", target]);
+        rate = target;
+        self.muted = YES;
+    }
+    ((void (*)(id, SEL, float))gOrigPlayAtRate)(self, _cmd, rate);
+}
+
+static void ASMySetRateTime(AVPlayer *self, SEL _cmd, float rate, CMTime time, CMTime host) {
+    ASRegisterPlayer(self);
+    float target = ASAdRateForPlayer(self);
+    if (target > rate) {
+        ASRecord([NSString stringWithFormat:@"AVPlayer(setRate:time:) 广告命中 %.0fx", target]);
+        rate = target;
+        self.muted = YES;
+    }
+    ((void (*)(id, SEL, float, CMTime, CMTime))gOrigSetRateTime)(self, _cmd, rate, time, host);
+}
+
+// 有些广告 SDK 会自己把 rate 拨回 1.0，这里每 0.35 秒补一刀
+static void ASStartRateWatchdog(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSTimer *timer = [NSTimer timerWithTimeInterval:0.35 repeats:YES block:^(NSTimer *t) {
+            if (!ASEngineOn()) return;
+            NSArray *players = nil;
+            @synchronized (gPlayers) { players = gPlayers.allObjects; }
+            for (AVPlayer *p in players) {
+                if (p.timeControlStatus != AVPlayerTimeControlStatusPlaying) continue;
+                AVPlayerItem *item = p.currentItem;
+                if (!item) continue;
+                Float64 d = CMTimeGetSeconds(item.duration);
+                if (!isfinite(d) || d <= 0.0 || d > kAdMaxDuration) continue;
+                float target = item.canPlayFastForward ? gRate : kAdRateFallback;
+                if (p.rate < target - 0.01f) {
+                    p.muted = YES;
+                    p.rate = target;
+                }
+            }
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    });
 }
 
 #pragma mark - WKWebView / Nebula 路径
@@ -149,7 +223,6 @@ static id ASMyInitWithFrameConfig(WKWebView *self, SEL _cmd, CGRect frame, WKWeb
             ucc = [[WKUserContentController alloc] init];
             config.userContentController = ucc;
         }
-        // 每次导航开始就把当前倍速写进 window，避免页面跳转后丢设置
         NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;", gRate];
         [ucc addUserScript:[[WKUserScript alloc] initWithSource:seed
                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
@@ -166,6 +239,164 @@ static id ASMyInitWithFrameConfig(WKWebView *self, SEL _cmd, CGRect frame, WKWeb
     return result;
 }
 
+#pragma mark - 弹窗记录（广告界面大概率是 present 出来的）
+
+static IMP gOrigPresent = NULL;
+
+static void ASMyPresent(UIViewController *self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
+    @try {
+        ASRecord([NSString stringWithFormat:@"弹窗: %@ -> %@",
+                  NSStringFromClass([self class]), NSStringFromClass([vc class])]);
+    } @catch (__unused NSException *e) {}
+    ((void (*)(id, SEL, id, BOOL, id))gOrigPresent)(self, _cmd, vc, animated, completion);
+}
+
+#pragma mark - 诊断：抓当前界面
+
+static void ASDumpView(UIView *view, int depth, NSMutableArray<NSString *> *lines) {
+    if (!view || lines.count > 150) return;
+    NSMutableString *indent = [NSMutableString string];
+    for (int i = 0; i < depth && i < 8; i++) [indent appendString:@"  "];
+    NSString *name = NSStringFromClass([view class]);
+    NSString *extra = @"";
+    if ([view isKindOfClass:NSClassFromString(@"WKWebView")]) extra = @"  <WKWebView>";
+    if (view.layer && [view.layer isKindOfClass:NSClassFromString(@"AVPlayerLayer")]) extra = @"  <AVPlayerLayer>";
+    [lines addObject:[NSString stringWithFormat:@"%@%@%@", indent, name, extra]];
+    for (UIView *sub in view.subviews) ASDumpView(sub, depth + 1, lines);
+}
+
+static int ASCountPlayerLayers(CALayer *layer) {
+    if (!layer) return 0;
+    int n = [layer isKindOfClass:NSClassFromString(@"AVPlayerLayer")] ? 1 : 0;
+    for (CALayer *sub in layer.sublayers) n += ASCountPlayerLayers(sub);
+    return n;
+}
+
+static NSArray<NSString *> *ASAdClassCandidates(void) {
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    if (!classes) return hits;
+    NSArray<NSString *> *needles = @[@"reward", @"interstitial", @"adplayer", @"adview", @"admanager", @"splash"];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *name = class_getName(classes[i]);
+        if (!name) continue;
+        NSString *s = [NSString stringWithUTF8String:name];
+        NSString *lower = s.lowercaseString;
+        for (NSString *n in needles) {
+            if ([lower containsString:n]) { [hits addObject:s]; break; }
+        }
+    }
+    free(classes);
+    return hits;
+}
+
+static NSString *ASBuildDiagnostics(void) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"AdSpeeder 诊断\n当前倍速: %gx\n\n", gRate];
+
+    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) [windows addObject:w];
+    }
+
+    [out appendFormat:@"== 窗口 %lu 个 ==\n", (unsigned long)windows.count];
+    for (UIWindow *w in windows) {
+        [out appendFormat:@"Lv%.0f %@  playerLayer=%d\n",
+         w.windowLevel, NSStringFromClass([w class]), ASCountPlayerLayers(w.layer)];
+    }
+
+    UIWindow *key = nil;
+    for (UIWindow *w in windows) { if (w.isKeyWindow) { key = w; break; } }
+    if (!key) key = windows.lastObject;
+
+    if (key) {
+        [out appendString:@"\n== 弹出的控制器链 ==\n"];
+        UIViewController *vc = key.rootViewController;
+        int guard = 0;
+        while (vc && guard++ < 8) {
+            [out appendFormat:@"%@\n", NSStringFromClass([vc class])];
+            vc = vc.presentedViewController;
+        }
+
+        [out appendString:@"\n== 视图层级 ==\n"];
+        NSMutableArray<NSString *> *lines = [NSMutableArray array];
+        ASDumpView(key.rootViewController.view, 0, lines);
+        [out appendFormat:@"%@\n", [lines componentsJoinedByString:@"\n"]];
+    }
+
+    [out appendString:@"\n== 名字像广告的类 ==\n"];
+    NSArray *cands = ASAdClassCandidates();
+    [out appendFormat:@"%@\n", cands.count ? [cands componentsJoinedByString:@"\n"] : @"(无)"];
+
+    return out;
+}
+
+#pragma mark - 诊断面板
+
+@interface ASDiagController : UIViewController
+@property (nonatomic, copy) NSString *body;
+@property (nonatomic, copy) NSString *heading;
+@end
+
+@implementation ASDiagController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.98];
+    CGRect b = self.view.bounds;
+    CGFloat top = 52, bottomBar = 64;
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, top, b.size.width - 32, 28)];
+    title.text = self.heading ?: @"诊断";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightSemibold];
+    [self.view addSubview:title];
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(12, top + 36,
+                                                                 b.size.width - 24,
+                                                                 b.size.height - top - 36 - bottomBar - 10)];
+    tv.text = self.body ?: @"";
+    tv.editable = NO;
+    tv.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1];
+    tv.textColor = [UIColor colorWithWhite:0.92 alpha:1];
+    tv.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    tv.layer.cornerRadius = 8;
+    tv.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    [self.view addSubview:tv];
+
+    CGFloat by = b.size.height - bottomBar + 4;
+    UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
+    copy.frame = CGRectMake(16, by, (b.size.width - 44) / 2, 44);
+    [copy setTitle:@"复制全部" forState:UIControlStateNormal];
+    copy.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    [copy setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    copy.layer.cornerRadius = 10;
+    [copy addTarget:self action:@selector(doCopy) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:copy];
+
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(b.size.width / 2 + 6, by, (b.size.width - 44) / 2, 44);
+    [close setTitle:@"关闭" forState:UIControlStateNormal];
+    close.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
+    [close setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    close.layer.cornerRadius = 10;
+    [close addTarget:self action:@selector(doClose) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:close];
+}
+
+- (void)doCopy {
+    UIPasteboard.generalPasteboard.string = self.body ?: @"";
+    UIButton *b = nil;
+    for (UIView *v in self.view.subviews) if ([v isKindOfClass:[UIButton class]]) { b = (UIButton *)v; break; }
+    [b setTitle:@"已复制 ✓" forState:UIControlStateNormal];
+}
+
+- (void)doClose { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+@end
+
 #pragma mark - 悬浮球
 
 static const float kSpeedSteps[] = {0.0f, 2.0f, 4.0f, 8.0f, 16.0f, 32.0f};
@@ -179,7 +410,6 @@ static const int   kSpeedCount   = 6;
 @end
 
 @implementation ASOverlayWindow
-// 只让悬浮球本身接收触摸，其余区域完全透传，否则支付宝会点不动
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *v = [super hitTest:point withEvent:event];
     if (v == self || v == self.rootViewController.view) return nil;
@@ -194,10 +424,10 @@ static void ASRefreshBall(void) {
     if (!gBall) return;
     if (ASEngineOn()) {
         gBall.label.text = [NSString stringWithFormat:@"%gx", gRate];
-        gBall.backgroundColor = [UIColor colorWithRed:0.09 green:0.62 blue:0.35 alpha:0.78];
+        gBall.backgroundColor = [UIColor colorWithRed:0.09 green:0.62 blue:0.35 alpha:0.86];
     } else {
         gBall.label.text = @"关";
-        gBall.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.72];
+        gBall.backgroundColor = [UIColor colorWithWhite:0.15 alpha:0.78];
     }
 }
 
@@ -207,6 +437,7 @@ static void ASSetRate(float rate, BOOL persist) {
     ASRefreshBall();
     ASPushRateToAllWebViews();
     NSLog(@"[AdSpeeder] rate -> %gx (enabled=%d)", gRate, ASEngineOn());
+    ASRecord([NSString stringWithFormat:@"切换到 %gx", gRate]);
 }
 
 @implementation ASFloatingView
@@ -276,7 +507,7 @@ static void ASSetRate(float rate, BOOL persist) {
     if (!root) return;
 
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"AdSpeeder"
-                                                                  message:@"选择广告加速倍速"
+                                                                  message:@"倍速 / 诊断"
                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     NSArray *titles = @[@"关闭加速", @"2 倍", @"4 倍", @"8 倍", @"16 倍", @"32 倍"];
     for (int i = 0; i < kSpeedCount; i++) {
@@ -287,7 +518,22 @@ static void ASSetRate(float rate, BOOL persist) {
             ASSetRate(step, YES);
         }]];
     }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🔍 抓取当前界面" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        ASDiagController *vc = [[ASDiagController alloc] init];
+        vc.heading = @"当前界面（广告播放时抓）";
+        vc.body = ASBuildDiagnostics();
+        [root presentViewController:vc animated:YES completion:nil];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"📋 查看事件记录" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSArray *snapshot = nil;
+        @synchronized (gEvents) { snapshot = [gEvents copy]; }
+        ASDiagController *vc = [[ASDiagController alloc] init];
+        vc.heading = @"事件记录";
+        vc.body = snapshot.count ? [snapshot componentsJoinedByString:@"\n"] : @"(暂无记录)";
+        [root presentViewController:vc animated:YES completion:nil];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
     sheet.popoverPresentationController.sourceView = self;
     sheet.popoverPresentationController.sourceRect = self.bounds;
     [root presentViewController:sheet animated:YES completion:nil];
@@ -306,7 +552,7 @@ static void ASSetupFloatingUI(void) {
             break;
         }
     }
-    if (!scene) return;   // 还没进前台，稍后重试
+    if (!scene) return;
 
     CGRect bounds = scene.coordinateSpace.bounds;
 
@@ -332,28 +578,8 @@ static void ASSetupFloatingUI(void) {
     gOverlay = win;
     gBall = ball;
     ASRefreshBall();
+    ASRecord(@"悬浮球已就绪");
     NSLog(@"[AdSpeeder] overlay ready at %.0f,%.0f", x, y);
-}
-
-#pragma mark - 诊断：把名字像广告的类打到日志里
-
-static void ASLogAdCandidates(void) {
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (!classes) return;
-    NSMutableArray<NSString *> *hits = [NSMutableArray array];
-    NSArray<NSString *> *needles = @[@"reward", @"interstitial", @"adplayer", @"adview", @"admanager"];
-    for (unsigned int i = 0; i < count; i++) {
-        const char *name = class_getName(classes[i]);
-        if (!name) continue;
-        NSString *s = [NSString stringWithUTF8String:name];
-        NSString *lower = s.lowercaseString;
-        for (NSString *n in needles) {
-            if ([lower containsString:n]) { [hits addObject:s]; break; }
-        }
-    }
-    free(classes);
-    NSLog(@"[AdSpeeder] ad-class candidates (%lu): %@", (unsigned long)hits.count, hits);
 }
 
 #pragma mark - 入口
@@ -376,12 +602,16 @@ static void AdSpeederInit(void) {
     }
 
     gWebViews = [NSHashTable weakObjectsHashTable];
+    gPlayers  = [NSHashTable weakObjectsHashTable];
+    gEvents   = [NSMutableArray array];
     ASLoadPrefs();
 
     Class avPlayer = objc_getClass("AVPlayer");
     if (avPlayer) {
         ASSwizzle(avPlayer, @selector(setRate:), (IMP)ASMySetRate, &gOrigSetRate);
-        ASSwizzle(avPlayer, @selector(play),    (IMP)ASMyPlay,    &gOrigPlay);
+        ASSwizzle(avPlayer, @selector(play), (IMP)ASMyPlay, &gOrigPlay);
+        ASSwizzle(avPlayer, @selector(playImmediatelyAtRate:), (IMP)ASMyPlayAtRate, &gOrigPlayAtRate);
+        ASSwizzle(avPlayer, @selector(setRate:time:atHostTime:), (IMP)ASMySetRateTime, &gOrigSetRateTime);
     }
 
     Class wk = objc_getClass("WKWebView");
@@ -390,22 +620,26 @@ static void AdSpeederInit(void) {
                   (IMP)ASMyInitWithFrameConfig, &gOrigInitWithFrameConfig);
     }
 
-    NSLog(@"[AdSpeeder] installed (AVPlayer=%d, WKWebView=%d, rate=%gx)",
-          gOrigSetRate != NULL, gOrigInitWithFrameConfig != NULL, gRate);
+    Class vcc = objc_getClass("UIViewController");
+    if (vcc) {
+        ASSwizzle(vcc, @selector(presentViewController:animated:completion:),
+                  (IMP)ASMyPresent, &gOrigPresent);
+    }
+
+    ASStartRateWatchdog();
+
+    NSLog(@"[AdSpeeder] installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, wk=%d, present=%d, rate=%gx)",
+          gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
+          gOrigSetRateTime != NULL, gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate);
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            ASScheduleOverlay(15);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ ASLogAdCandidates(); });
-        });
+                       dispatch_get_main_queue(), ^{ ASScheduleOverlay(15); });
     }];
 
-    // 兜底：dylib 晚于 App 启动才加载时，直接排一次
     if (UIApplication.sharedApplication) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{ ASScheduleOverlay(15); });
