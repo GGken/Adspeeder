@@ -1,0 +1,30 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  dylib:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          brew install ldid xz make
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          make -j4
+          find . -name "AdSpeeder.dylib" -type f
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdSpeeder-dylib
+          path: "**/AdSpeeder.dylib"
+          if-no-files-found: error
