@@ -72,11 +72,16 @@ static NSString *const kPrefPosX    = @"adspeeder.x";
 static NSString *const kPrefPosY    = @"adspeeder.y";
 static NSString *const kPrefSeek    = @"adspeeder.seek";      // 自动跳片尾
 static NSString *const kPrefFakeAd  = @"adspeeder.fakead";    // JS 侧直通广告回调
+static NSString *const kPrefInstant = @"adspeeder.instant";   // 极速直通：广告出现即消失
 
 // 自动跳片尾：实测有效（广告 1.5 秒内就关），默认开
 static BOOL gSeekToEnd = YES;
 // JS 侧直通：拦截 my.createRewardedAd，让 onClose 直接回"看完了"
 static BOOL gFakeAd = NO;
+// 极速直通：发现广告就立刻藏画面 + 点关闭 + 补 JS 回调，用户基本看不到广告
+static BOOL gInstant = YES;
+// 菜单里手点"秒关"时为真：忽略直通开关，强制动作
+static BOOL gForceClose = NO;
 
 static float gRate = 16.0f;                     // 0 = 关闭
 static NSHashTable<WKWebView *> *gWebViews = nil;
@@ -102,6 +107,9 @@ static NSString *ASProbeBeePlayer(id p);
 static double ASBeePlayerDuration(id p);
 static void ASFireJsAdClose(void);
 static int  ASAutoCloseDwellAd(void);
+static int  ASInstantKillAd(void);
+static void ASAutoConfirmExitAlert(UIAlertController *ac, int tries);
+static BOOL ASIsAdExitAlert(UIAlertController *ac);
 
 static BOOL ASIsAlipay(void) {
     static BOOL result = NO;
@@ -165,6 +173,7 @@ static void ASLoadPrefs(void) {
     }
     if ([d objectForKey:kPrefSeek] != nil) gSeekToEnd = [d boolForKey:kPrefSeek];
     if ([d objectForKey:kPrefFakeAd] != nil) gFakeAd = [d boolForKey:kPrefFakeAd];
+    if ([d objectForKey:kPrefInstant] != nil) gInstant = [d boolForKey:kPrefInstant];
 }
 
 static void ASSavePrefs(void) {
@@ -173,6 +182,7 @@ static void ASSavePrefs(void) {
     [d setFloat:(ASEngineOn() ? gRate : 16.0f) forKey:kPrefRate];
     [d setBool:gSeekToEnd forKey:kPrefSeek];
     [d setBool:gFakeAd forKey:kPrefFakeAd];
+    [d setBool:gInstant forKey:kPrefInstant];
     [d synchronize];
 }
 
@@ -194,6 +204,18 @@ static BOOL ASLooksLikeAdName(NSString *name) {
     if ([l containsString:@"adview"] || [l containsString:@"adplayer"] ||
         [l containsString:@"admanager"] || [l containsString:@"adcontroller"] ||
         [l containsString:@"adreward"]) return YES;
+    return NO;
+}
+
+// 更宽的"这玩意儿是广告容器"判定，用于"出现即隐藏"。
+// 只用来找画面容器，不用于改行为，误判最多是白藏一帧，有 2.5 秒自动恢复兜底。
+static BOOL ASNameAdish(NSString *name) {
+    if (name.length < 4) return NO;
+    NSString *l = name.lowercaseString;
+    NSArray *kw = @[@"reward", @"interstitial", @"adview", @"advideo", @"adplayer",
+                    @"adcontainer", @"adwindow", @"adpage", @"splashad", @"beereward",
+                    @"beead", @"beevideoplayer", @"advideoplayer", @"promotion"];
+    for (NSString *k in kw) if ([l containsString:k]) return YES;
     return NO;
 }
 
@@ -694,10 +716,24 @@ static void ASMyPresent(UIViewController *self, SEL _cmd, UIViewController *vc, 
                       ac.title.length ? ac.title : @"(无标题)", ac.message ?: @""]);
         }
     } @catch (__unused NSException *e) {}
+
     ((void (*)(id, SEL, id, BOOL, id))gOrigPresent)(self, _cmd, vc, animated, completion);
+
+    // 广告页是"present 出来的"：上来就先藏掉，用户看不到内容
+    @try {
+        if ((gFakeAd || gForceClose) && vc && !ASIsOwnWindow(vc.view.window) &&
+            ASNameAdish(NSStringFromClass([vc class]))) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @try { vc.view.alpha = 0.0; } @catch (__unused NSException *e) {}
+                ASRecord([NSString stringWithFormat:@"广告页出现即隐藏: %@", NSStringFromClass([vc class])]);
+                ASInstantKillAd();
+            });
+        }
+    } @catch (__unused NSException *e) {}
 }
 
-// 弹出框的标题/正文往往直接写着"未完成观看"或"奖励已发放"，
+// 弹窗的标题/正文往往直接写着"未完成观看"或"奖励已发放"，
 // 这是判断奖励到底给没给的最直接证据，所以单独记一条。
 static id (*gOrigAlert)(id, SEL, NSString *, NSString *, NSInteger) = NULL;
 
@@ -709,12 +745,43 @@ static id ASMyAlert(id self, SEL _cmd, NSString *title, NSString *message, NSInt
                       title.length ? title : @"(无标题)", message ?: @""]);
         }
     } @catch (__unused NSException *e) {}
-    return gOrigAlert(self, _cmd, title, message, style);
+    id ac = gOrigAlert(self, _cmd, title, message, style);
+    // 广告 SDK 的"再看 N 秒？坚持退出 / 继续观看"——自动替用户选退出
+    @try {
+        if (ac && [ac isKindOfClass:[UIAlertController class]] && ASIsAdExitAlert((UIAlertController *)ac)) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.03 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ASAutoConfirmExitAlert((UIAlertController *)ac, 0);
+            });
+        }
+    } @catch (__unused NSException *e) {}
+    return ac;
 }
 
-#pragma mark - 广告巡检（自动抓，不用卡时间）
+// 广告窗口常是独立 UIWindow（BEEAlertManagedWindow 之类），makeKeyAndVisible 时就能拦：
+// 直接 alpha=0 → 一帧都不渲染；2.5 秒后恢复，避免把窗口永久弄瞎。
+static IMP gOrigMakeVisible = NULL;
 
-static NSString *ASSnapshotOfView(UIView *v) {
+static void ASMyMakeVisible(UIWindow *self, SEL _cmd) {
+    @try {
+        if ((gFakeAd || gForceClose) && gInstant && !ASIsOwnWindow(self) &&
+            (ASNameAdish(NSStringFromClass([self class])) ||
+             ASNameAdish(NSStringFromClass([self.rootViewController class])))) {
+            self.alpha = 0.0;
+            ASRecord([NSString stringWithFormat:@"广告窗口一出现就藏起来: %@",
+                      NSStringFromClass([self class])]);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ ASInstantKillAd(); });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self.alpha < 0.05) self.alpha = 1.0;
+            });
+        }
+    } @catch (__unused NSException *e) {}
+    ((void (*)(id, SEL))gOrigMakeVisible)(self, _cmd);
+}
+
+#pragma mark - 广告巡检（自动抓，不用卡时间）static NSString *ASSnapshotOfView(UIView *v) {
     NSMutableString *s = [NSMutableString string];
     Class cls = [v class];
     [s appendFormat:@"%@  frame=%@\n", NSStringFromClass(cls), NSStringFromCGRect(v.frame)];
@@ -1503,11 +1570,205 @@ static void ASFireJsAdClose(void) {
 
 static NSMutableSet<NSString *> *gDwellHandled = nil;
 static NSTimeInterval gLastDwellAction = 0;
-static BOOL gForceClose = NO;          // 菜单里手点"秒关"时为真，忽略直通开关
+
+#pragma mark - 极速直通：广告出现即消失
+
+// 目标：用户"几乎看不到广告"，但游戏照样发奖。
+// 思路（四件事同时做，任何一条生效都能拿到奖励）：
+//   1) 把广告容器/广告窗口 alpha 直接设 0 —— 画面还没画出来就没了
+//   2) 立刻给它的关闭按钮发 sendActions（alpha=0 不影响事件派发）
+//   3) SDK 常弹"再看 14 秒？坚持退出/继续观看"，这里自动选"坚持退出"
+//   4) 立刻从 JS 层补发 onClose(isEnded=true)，让游戏自己的发奖逻辑跑起来
+// 万一没关干净，1.6 秒后会把藏起来的视图恢复，避免把人卡在黑屏。
+
+static NSTimeInterval gLastInstantKill = 0;
+static NSMutableArray<UIWindow *> *gHiddenWins  = nil;
+static NSMutableArray<UIView *>   *gHiddenViews = nil;
+
+// 只处理"广告类"的确认框，别把游戏自己的弹窗点了
+static BOOL ASIsAdExitAlert(UIAlertController *ac) {
+    NSString *s = [NSString stringWithFormat:@"%@ %@", ac.title ?: @"", ac.message ?: @""];
+    if ([s containsString:@"离开"] || [s containsString:@"再看"] || [s containsString:@"退出"]) return YES;
+    __block BOOL hasLeave = NO;
+    for (UIAlertAction *a in ac.actions) {
+        NSString *t = a.title ?: @"";
+        if ([t containsString:@"退出"] || [t containsString:@"放弃"] || [t containsString:@"坚持"]) hasLeave = YES;
+    }
+    return hasLeave;
+}
+
+static void ASAutoConfirmExitAlert(UIAlertController *ac, int tries) {
+    if (!ac || tries > 40) return;
+    if (!gFakeAd && !gForceClose) return;
+
+    // 还没上屏就先等，等它真的显示出来再点，否则 handler 里 dismiss 会空转
+    if (ac.view.window == nil) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.06 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ ASAutoConfirmExitAlert(ac, tries + 1); });
+        return;
+    }
+
+    UIAlertAction *pick = nil;
+    for (UIAlertAction *a in ac.actions) {
+        NSString *t = a.title ?: @"";
+        if ([t containsString:@"退出"] || [t containsString:@"放弃"] || [t containsString:@"坚持"] ||
+            [t containsString:@"不看了"] || [t containsString:@"关闭"]) { pick = a; break; }
+    }
+    ASRecord([NSString stringWithFormat:@"自动点掉确认框：%@ | %@",
+              ac.title ?: @"", pick.title ?: @"(直接关)"]);
+    if (!pick) { [ac dismissViewControllerAnimated:NO completion:nil]; return; }
+
+    id handler = nil;
+    @try { handler = [pick valueForKey:@"handler"]; } @catch (__unused NSException *e) {}
+    if (handler) { ((void (^)(UIAlertAction *))handler)(pick); }
+    else { [ac dismissViewControllerAnimated:NO completion:nil]; }
+}
+
+// 广告页上的计时文案："浏览14秒得奖励" / "再看9秒" / "观看广告得奖励"
+static BOOL ASIsAdCountdownText(NSString *t) {
+    if (t.length == 0) return NO;
+    if ([t containsString:@"得奖励"]) return YES;
+    if ([t containsString:@"秒"] &&
+        ([t containsString:@"浏览"] || [t containsString:@"观看"] ||
+         [t containsString:@"再看"] || [t containsString:@"广告"])) return YES;
+    return NO;
+}
+
+static int ASInstantKillAd(void) {
+    if (!ASIsAlipay()) return 0;
+    if (!gFakeAd && !gForceClose) return 0;
+    if (!gInstant && !gForceClose) return 0;
+    if (!gForceClose && UIApplication.sharedApplication.applicationState != UIApplicationStateActive) return 0;
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - gLastInstantKill < 0.6) return 0;
+
+    NSMutableArray<UIWindow *> *adWins = [NSMutableArray array];
+    NSMutableArray<UIView *>   *panels = [NSMutableArray array];
+    NSMutableArray<UIButton *> *btns   = [NSMutableArray array];
+    NSMutableArray<UIButton *> *corner = [NSMutableArray array];   // 右上角那颗 ✕
+    NSMutableArray<UIButton *> *exitBtns = [NSMutableArray array]; // "坚持退出"
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        BOOL winAd = ASNameAdish(NSStringFromClass([w class])) ||
+                     ASNameAdish(NSStringFromClass([w.rootViewController class]));
+
+        __block BOOL signal = NO;
+        __block UIView *panel = nil;
+        NSMutableArray<UIButton *> *winBtns   = [NSMutableArray array];
+        NSMutableArray<UIButton *> *winCorner = [NSMutableArray array];
+        NSMutableArray<UIButton *> *winExit   = [NSMutableArray array];   // "坚持退出"
+        CGRect winB = w.bounds;
+
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (!v.window) return;
+            NSString *cn = NSStringFromClass([v class]);
+            if (ASNameAdish(cn)) signal = YES;
+
+            if ([v isKindOfClass:[UILabel class]] && ASIsAdCountdownText(((UILabel *)v).text)) {
+                signal = YES;
+                // 往上找"铺满整屏"的那一层，这才是要藏的广告面板
+                UIView *p = v;
+                for (int i = 0; i < 10 && p.superview; i++) {
+                    p = p.superview;
+                    if (CGRectGetWidth(p.bounds) >= CGRectGetWidth(winB) * 0.9 &&
+                        CGRectGetHeight(p.bounds) >= CGRectGetHeight(winB) * 0.9) {
+                        panel = p;
+                        break;
+                    }
+                }
+            }
+
+            if ([v isKindOfClass:[UIButton class]]) {
+                UIButton *b = (UIButton *)v;
+                if (!b.hidden && b.alpha > 0.01) {
+                    NSString *t = [b titleForState:UIControlStateNormal] ?: @"";
+                    if (t.length && ([t containsString:@"关闭"] || [t isEqualToString:@"×"] ||
+                                     [t isEqualToString:@"X"] || [t containsString:@"跳过"])) {
+                        [winBtns addObject:b];
+                    }
+                    // "再看14秒得奖励  确认离开嘛？[坚持退出][继续观看]" —— 自定义弹窗版
+                    if (t.length && ([t containsString:@"退出"] || [t containsString:@"放弃"] ||
+                                     [t containsString:@"狠心"] || [t containsString:@"坚持"])) {
+                        [winExit addObject:b];
+                    }
+                    // 右上角大概率是"关闭这条广告"的 ✕（可能没文字）
+                    CGRect r = [b convertRect:b.bounds toView:w];
+                    if (CGRectGetMaxY(r) < winB.size.height * 0.22 &&
+                        r.origin.x > winB.size.width * 0.62 &&
+                        CGRectGetWidth(r) > 8 && CGRectGetWidth(r) < winB.size.width * 0.4) {
+                        [winCorner addObject:b];
+                    }
+                }
+            }
+        });
+
+        if (!signal && !winAd) continue;      // 这个窗口不像广告，里面的按钮一个都不碰
+        if (winAd) [adWins addObject:w];
+        if (panel) [panels addObject:panel];
+        [btns addObjectsFromArray:winBtns];
+        [corner addObjectsFromArray:winCorner];
+        [exitBtns addObjectsFromArray:winExit];
+    }
+
+    if (adWins.count == 0 && panels.count == 0 && btns.count == 0 && exitBtns.count == 0) return 0;
+
+    gLastInstantKill = now;
+    if (!gHiddenWins)  gHiddenWins  = [NSMutableArray array];
+    if (!gHiddenViews) gHiddenViews = [NSMutableArray array];
+
+    // 1) 先抹掉画面（给按钮发事件不受 alpha 影响）
+    for (UIWindow *w in adWins) {
+        if (w.alpha > 0.05) { [gHiddenWins addObject:w]; w.alpha = 0.0; }
+    }
+    for (UIView *v in panels) {
+        if (v.alpha > 0.05) { [gHiddenViews addObject:v]; v.alpha = 0.0; }
+    }
+
+    // 2) 点按钮：先处理"确认离开"弹窗，再点广告自己的关闭 ✕
+    BOOL clicked = NO;
+    for (UIButton *b in exitBtns) {
+        [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+        clicked = YES;
+        break;
+    }
+    if (!clicked) {
+        for (UIButton *b in btns) {
+            [b sendActionsForControlEvents:UIControlEventTouchUpInside];
+            clicked = YES;
+            break;
+        }
+    }
+    if (!clicked && corner.count > 0) {
+        [corner.firstObject sendActionsForControlEvents:UIControlEventTouchUpInside];
+        clicked = YES;
+    }
+
+    // 3) 补 JS 关闭（游戏侧 onClose → 发奖），两次，防止第一次还没注册回调
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ ASFireJsAdClose(); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.55 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ ASFireJsAdClose(); });
+
+    // 4) 兜底恢复：真没关掉的话，1.6 秒后把画面放出来，别让人卡住
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        for (UIWindow *w in gHiddenWins) { if (w.alpha < 0.05) w.alpha = 1.0; }
+        for (UIView *v in gHiddenViews) { if (v.alpha < 0.05) v.alpha = 1.0; }
+        [gHiddenWins removeAllObjects];
+        [gHiddenViews removeAllObjects];
+    });
+
+    ASRecord([NSString stringWithFormat:@"极速直通：藏 %lu 窗 / %lu 面板，点关闭=%@，已补 JS",
+              (unsigned long)adWins.count, (unsigned long)panels.count, clicked ? @"成功" : @"没找到"]);
+    return 1;
+}
 
 static int ASAutoCloseDwellAd(void) {
     if (!ASIsAlipay()) return 0;
     if (!gFakeAd && !gForceClose) return 0;
+    if (gInstant && !gForceClose) return 0;   // 极速直通已经在更早的环节处理了
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if (now - gLastDwellAction < 2.0) return 0;
     if (!gDwellHandled) gDwellHandled = [NSMutableSet set];
@@ -2002,11 +2263,21 @@ static void ASSetRate(float rate, BOOL persist) {
         ASRecord([NSString stringWithFormat:@"JS 直通广告回调 %@（下次点广告生效）", gFakeAd ? @"开" : @"关"]);
     }]];
 
+    [sheet addAction:[UIAlertAction actionWithTitle:(gInstant ? @"⚡ 极速直通（广告一闪就没）：开" : @"⚡ 极速直通（广告一闪就没）：关")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        gInstant = !gInstant;
+        ASSavePrefs();
+        ASRecord([NSString stringWithFormat:@"极速直通 %@", gInstant ? @"开" : @"关"]);
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ 秒关当前广告" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         gLastDwellAction = 0;
+        gLastInstantKill = 0;
         if (gDwellHandled) [gDwellHandled removeAllObjects];
         gForceClose = YES;
-        int hit = ASAutoCloseDwellAd();
+        int hit = ASInstantKillAd();
+        if (!hit) hit = ASAutoCloseDwellAd();
         gForceClose = NO;
         ASFireJsAdClose();
         ASRecord([NSString stringWithFormat:@"手动秒关：%@", hit ? @"已点关闭" : @"没找到广告容器"]);
@@ -2166,14 +2437,30 @@ static void AdSpeederInit(void) {
                        (IMP)ASMyAlert, (IMP *)&gOrigAlert);
     }
 
+    Class winCls = objc_getClass("UIWindow");
+    if (winCls) {
+        ASSwizzle(winCls, @selector(makeKeyAndVisible), (IMP)ASMyMakeVisible, &gOrigMakeVisible);
+    }
+
     ASStartRateWatchdog();
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v9 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
+    // 极速直通的"哨兵"：0.15 秒一轮，发现广告就抹掉画面 + 点关闭 + 补 JS
+    {
+        NSTimer *fast = [NSTimer timerWithTimeInterval:0.15 repeats:YES block:^(NSTimer *timer) {
+            @try {
+                if (gInstant || gForceClose) ASInstantKillAd();
+            } @catch (__unused NSException *e) {}
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:fast forMode:NSRunLoopCommonModes];
+    }
+
+    NSLog(@"[AdSpeeder] v10 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, makeVisible=%d, rate=%gx, autoSkip=%d, instant=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
-          gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
+          gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL,
+          gOrigMakeVisible != NULL, gRate, (int)gAutoSkip, (int)gInstant);
 
     // 通用倍速 hook + BEE 广告 hook：模块可能在启动后才加载，分几轮补
     for (NSNumber *delay in @[@0.5, @2.0, @5.0, @10.0]) {
