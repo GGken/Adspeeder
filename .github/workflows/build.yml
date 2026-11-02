@@ -20,11 +20,13 @@ jobs:
       - name: Build
         run: |
           make -j4
-          find . -name "AdSpeeder.dylib" -type f
+          mkdir -p dist
+          find . -name "AdSpeeder.dylib" -type f -print -exec cp {} dist/ \;
+          ls -l dist
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: AdSpeeder-dylib
-          path: "**/AdSpeeder.dylib"
+          path: dist/AdSpeeder.dylib
           if-no-files-found: error
