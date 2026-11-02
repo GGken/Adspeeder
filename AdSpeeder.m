@@ -191,9 +191,6 @@ static NSArray<UIWindow *> *ASAllWindows(void) {
                 if (![out containsObject:w]) [out addObject:w];
             }
         }
-        for (UIWindow *w in UIApplication.sharedApplication.windows) {
-            if (![out containsObject:w]) [out addObject:w];
-        }
     } @catch (__unused NSException *e) {}
     return out;
 }
