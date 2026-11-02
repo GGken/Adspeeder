@@ -1,5 +1,12 @@
-// AdSpeeder v4 - Alipay mini-game rewarded-video ad accelerator
+// AdSpeeder v5 - Alipay mini-game rewarded-video ad accelerator
 // 纯 objc runtime swizzling，不带 substrate / logos 依赖，TrollFools 注入可加载。
+//
+// v5：
+//   1. 「🧾 视图时间线」：窗口里新冒出来的 Ad*/video/player/webview 自动留痕，
+//      广告播完再看也能还原当时到底谁在渲染（不用抢时间截图）
+//   2. 自动秒过加了 BEE 播放器兜底：从播放器往上找 countDownEnd 的宿主视图
+//   3. setPlayTime: / playedTime: 双路推进度，countDownEnd 前先把 playTime 顶满
+//   4. 诊断面板改成打开即自动复制，另加醒目复制按钮 + "已复制" 提示
 //
 // v4：拿到真实类名后改成对着 mPaaS BEE 广告 SDK 打
 //   1. 主入口 -[AdRewardedVideoView countDownEnd]：倒计时归零 = 发奖 + 关闭
@@ -556,8 +563,90 @@ static NSString *ASSnapshotOfView(UIView *v) {
     return s;
 }
 
+#pragma mark - 出现即留痕（不用抢在广告播放时截图）
+
+// 光看类是否存在没用（二进制里本来就有一堆 Ad* 类），要看广告出现那一刻
+// 屏幕上"新冒出来"的是什么。这里对窗口里每个新出现的相关视图/网页记一条时间线，
+// 广告播完再看也能还原当时到底是谁在渲染。
+
+static NSMutableArray<NSString *> *gTimeline = nil;
+static NSMutableSet<NSString *> *gTimelineSeen = nil;
+static NSTimeInterval gTimelineStart = 0;
+
+static BOOL ASIsInterestingName(NSString *name) {
+    if (name.length < 4) return NO;
+    NSString *l = name.lowercaseString;
+    NSArray *kw = @[@"reward", @"video", @"player", @"bee", @"cdp", @"tinyapp",
+                    @"nebula", @"h5", @"webview", @"interstitial", @"promotion"];
+    for (NSString *k in kw) if ([l containsString:k]) return YES;
+    if ([name hasPrefix:@"Ad"] && name.length > 2 &&
+        [[NSCharacterSet uppercaseLetterCharacterSet] characterIsMember:[name characterAtIndex:2]]) return YES;
+    return NO;
+}
+
+static void ASTimelineAdd(NSString *line) {
+    if (!gTimeline) {
+        gTimeline = [NSMutableArray array];
+        gTimelineSeen = [NSMutableSet set];
+        gTimelineStart = [NSDate timeIntervalSinceReferenceDate];
+    }
+    if (gTimeline.count >= 400) return;
+    double el = [NSDate timeIntervalSinceReferenceDate] - gTimelineStart;
+    [gTimeline addObject:[NSString stringWithFormat:@"+%.1fs %@", el, line]];
+}
+
+static void ASTimelineScan(void) {
+    if (!gTimeline) {
+        gTimeline = [NSMutableArray array];
+        gTimelineSeen = [NSMutableSet set];
+        gTimelineStart = [NSDate timeIntervalSinceReferenceDate];
+    }
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        if (w.hidden || w.alpha < 0.01) continue;
+        double lv = w.windowLevel;
+
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            NSString *cn = NSStringFromClass([v class]);
+
+            if ([v isKindOfClass:[WKWebView class]]) {
+                NSString *url = ((WKWebView *)v).URL.absoluteString ?: @"(about:blank)";
+                NSString *key = [@"WEB " stringByAppendingString:url];
+                if (![gTimelineSeen containsObject:key]) {
+                    [gTimelineSeen addObject:key];
+                    ASTimelineAdd([NSString stringWithFormat:@"Lv%.0f WEB  %@", lv, url]);
+                }
+                return;
+            }
+
+            if (!ASIsInterestingName(cn)) return;
+            NSString *key = [NSString stringWithFormat:@"V%.0f-%@", lv, cn];
+            if ([gTimelineSeen containsObject:key]) return;
+            [gTimelineSeen addObject:key];
+            CGRect f = v.frame;
+            ASTimelineAdd([NSString stringWithFormat:@"Lv%.0f %@  %.0fx%.0f", lv, cn, f.size.width, f.size.height]);
+        });
+    }
+}
+
+static NSString *ASBuildTimelineReport(void) {
+    if (!gTimeline || gTimeline.count == 0) {
+        return @"(还没记录到任何视图)\n\n先把广告播一次，再回来看这里。";
+    }
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"视图时间线（共 %lu 条，从注入时刻起算）\n\n",
+     (unsigned long)gTimeline.count];
+    NSUInteger from = gTimeline.count > 120 ? gTimeline.count - 120 : 0;
+    for (NSUInteger i = from; i < gTimeline.count; i++) {
+        [out appendFormat:@"%@\n", gTimeline[i]];
+    }
+    return out;
+}
+
 static void ASScanOnce(void) {
     if (!ASIsAlipay()) return;
+    @try { ASTimelineScan(); } @catch (__unused NSException *e) {}
     NSArray<UIWindow *> *wins = ASAllWindows();
     if (!gSeenAdClasses) gSeenAdClasses = [NSMutableSet set];
     NSMutableArray<UIView *> *ads = [NSMutableArray array];
@@ -606,10 +695,8 @@ static void ASScanOnce(void) {
         }
     }
 
-    // 自动秒过：只在广告真在屏上时动作
-    if (visibleAds.count > 0) {
-        @try { ASAutoSkipVisibleAds(); } @catch (__unused NSException *e) {}
-    }
+    // 自动秒过：自己会再扫一遍，不依赖上面的广告视图判定
+    @try { ASAutoSkipVisibleAds(); } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - 广告倒计时压缩
@@ -797,6 +884,17 @@ static int ASRunSkipStep(UIView *v, int step, NSMutableString *log) {
         if (!ASResponds(v, @"countDownEnd")) return 0;
         sel = NSSelectorFromString(@"countDownEnd");
         what = @"countDownEnd";
+
+        // 先把 playTime 顶到 duration，让 SDK 自己的判断也认为"看完了"
+        if (ASResponds(v, @"setPlayTime:") && ASResponds(v, @"duration")) {
+            @try {
+                double dur = ((double (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"duration"));
+                if (dur > 0) {
+                    ((void (*)(id, SEL, double))objc_msgSend)(v, NSSelectorFromString(@"setPlayTime:"), dur);
+                    what = @"setPlayTime:(满) + countDownEnd";
+                }
+            } @catch (__unused NSException *e) {}
+        }
     } else if (step == 1) {
         if (!ASResponds(v, @"BeeVideoPlayerViewDidFinishPlay:")) return 0;
         player = ASFindBeePlayer(v);
@@ -843,9 +941,21 @@ static int ASAutoSkipVisibleAds(void) {
         if (ASIsOwnWindow(w)) continue;
         ASWalkViews(w, 0, ^(UIView *v, int d) {
             if (![v isKindOfClass:[UIView class]]) return;
-            if (!ASIsRewardAdView(v)) return;
             if (!v.window || v.hidden || v.alpha < 0.01) return;
-            [live addObject:v];
+
+            if (ASIsRewardAdView(v)) { [live addObject:v]; return; }
+
+            // 兜底：只认播放器，往上找能 countDownEnd 的宿主视图。
+            // 万一广告外层不是 AdRewardedVideoView，这条路也能对上。
+            NSString *cn = NSStringFromClass([v class]);
+            if ([cn containsString:@"BeeVideoPlayer"]) {
+                for (UIView *p = v.superview; p; p = p.superview) {
+                    if (ASResponds(p, @"countDownEnd")) {
+                        if (![live containsObject:p]) [live addObject:p];
+                        break;
+                    }
+                }
+            }
         });
     }
 
@@ -982,6 +1092,24 @@ static NSString *ASBuildAdInstanceReport(void) {
 // 把回传的秒数放大，倒计时自然就提前归零，跟真实视频解码无关。
 static IMP gOrigPlayedTimeF = NULL;
 static IMP gOrigPlayedTimeD = NULL;
+static IMP gOrigSetPlayTime = NULL;
+
+// setPlayTime: 是进度落到视图上的最后一道：不放大 playedTime 也能从这里把进度推上去
+static void ASMySetPlayTime(id self, SEL _cmd, double t) {
+    IMP orig = gOrigSetPlayTime;
+    if (!orig) return;
+    double out = t;
+    if (ASEngineOn() && t > 0.0) {
+        out = t * (double)gRate;
+        @try {
+            if ([self respondsToSelector:NSSelectorFromString(@"duration")]) {
+                double d = ((double (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"duration"));
+                if (d > 0.0 && out > d) out = d;
+            }
+        } @catch (__unused NSException *e) {}
+    }
+    ((void (*)(id, SEL, double))orig)(self, _cmd, out);
+}
 
 static void ASMyPlayedTimeF(id self, SEL _cmd, id player, float t) {
     IMP orig = gOrigPlayedTimeF;
@@ -1018,6 +1146,15 @@ static void ASInstallBeeHooks(void) {
     Class cls = NSClassFromString(@"AdRewardedVideoView");
     if (!cls) return;
 
+    if (!gOrigSetPlayTime) {
+        Method sp = class_getInstanceMethod(cls, NSSelectorFromString(@"setPlayTime:"));
+        if (sp) {
+            gOrigSetPlayTime = method_getImplementation(sp);
+            method_setImplementation(sp, (IMP)ASMySetPlayTime);
+            ASRecord(@"BEE setPlayTime hook 挂上");
+        }
+    }
+
     SEL sel = NSSelectorFromString(@"BeeVideoPlayerView:playedTime:");
     Method m = class_getInstanceMethod(cls, sel);
     if (!m || gOrigPlayedTimeF || gOrigPlayedTimeD) return;
@@ -1040,7 +1177,7 @@ static void ASInstallBeeHooks(void) {
 
 static NSString *ASBuildInterfaceReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"AdSpeeder 诊断 v4\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
+    [out appendFormat:@"AdSpeeder 诊断 v5\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
      gRate, ASEngineOn() ? @"开" : @"关", gAutoSkip ? @"开" : @"关",
      (unsigned long)gGenHooked.count, gTimerHits];
 
@@ -1162,8 +1299,9 @@ static NSString *ASBuildAdClassReport(void) {
 
     CGFloat by = b.size.height - bottomBar + 4;
     UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
+    copy.tag = 2001;
     copy.frame = CGRectMake(16, by, (b.size.width - 44) / 2, 44);
-    [copy setTitle:@"复制全部" forState:UIControlStateNormal];
+    [copy setTitle:@"📋 复制全文" forState:UIControlStateNormal];
     copy.backgroundColor = [UIColor colorWithWhite:0.22 alpha:1];
     [copy setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     copy.layer.cornerRadius = 10;
@@ -1178,16 +1316,49 @@ static NSString *ASBuildAdClassReport(void) {
     close.layer.cornerRadius = 10;
     [close addTarget:self action:@selector(doClose) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:close];
+
+    // 面板一打开就把全文塞进剪贴板，不用再点
+    [self doCopy];
 }
 
 - (void)doCopy {
-    UIPasteboard.generalPasteboard.string = self.body ?: @"";
+    NSString *text = self.body ?: @"";
+    UIPasteboard.generalPasteboard.string = text;
+
     for (UIView *v in self.view.subviews) {
-        if ([v isKindOfClass:[UIButton class]]) {
-            [(UIButton *)v setTitle:@"已复制 ✓" forState:UIControlStateNormal];
-            break;
+        if ([v isKindOfClass:[UIButton class]] && v.tag == 2001) {
+            UIButton *btn = (UIButton *)v;
+            [btn setTitle:[NSString stringWithFormat:@"✓ 已复制 %lu 字", (unsigned long)text.length]
+                forState:UIControlStateNormal];
+            btn.backgroundColor = [UIColor colorWithRed:0.09 green:0.62 blue:0.35 alpha:1];
         }
     }
+    [self showToast:@"已复制到剪贴板，直接去粘贴即可"];
+}
+
+- (void)showToast:(NSString *)msg {
+    UIView *old = [self.view viewWithTag:2002];
+    if (old) [old removeFromSuperview];
+
+    CGRect b = self.view.bounds;
+    UILabel *toast = [[UILabel alloc] initWithFrame:CGRectMake(24, b.size.height / 2 - 26,
+                                                              b.size.width - 48, 52)];
+    toast.tag = 2002;
+    toast.text = msg;
+    toast.numberOfLines = 2;
+    toast.textAlignment = NSTextAlignmentCenter;
+    toast.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    toast.textColor = [UIColor whiteColor];
+    toast.backgroundColor = [UIColor colorWithRed:0.09 green:0.62 blue:0.35 alpha:0.96];
+    toast.layer.cornerRadius = 12;
+    toast.layer.masksToBounds = YES;
+    toast.alpha = 0;
+    [self.view addSubview:toast];
+
+    [UIView animateWithDuration:0.18 animations:^{ toast.alpha = 1; } completion:^(BOOL ok) {
+        [UIView animateWithDuration:0.35 delay:1.5 options:0 animations:^{ toast.alpha = 0; }
+                         completion:^(BOOL done) { [toast removeFromSuperview]; }];
+    }];
 }
 
 - (void)doClose { [self dismissViewControllerAnimated:YES completion:nil]; }
@@ -1332,6 +1503,13 @@ static void ASSetRate(float rate, BOOL persist) {
         [root presentViewController:vc animated:YES completion:nil];
     }]];
 
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🧾 视图时间线" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        ASDiagController *vc = [[ASDiagController alloc] init];
+        vc.heading = @"广告期间冒出来的视图";
+        vc.body = ASBuildTimelineReport();
+        [root presentViewController:vc animated:YES completion:nil];
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"🎯 广告实例" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         ASDiagController *vc = [[ASDiagController alloc] init];
         vc.heading = @"广告实例 / BEE 播放器";
@@ -1467,7 +1645,7 @@ static void AdSpeederInit(void) {
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v4 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
+    NSLog(@"[AdSpeeder] v5 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
           gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
