@@ -1,5 +1,12 @@
-// AdSpeeder v3 - Alipay mini-game rewarded-video ad accelerator
+// AdSpeeder v4 - Alipay mini-game rewarded-video ad accelerator
 // 纯 objc runtime swizzling，不带 substrate / logos 依赖，TrollFools 注入可加载。
+//
+// v4：拿到真实类名后改成对着 mPaaS BEE 广告 SDK 打
+//   1. 主入口 -[AdRewardedVideoView countDownEnd]：倒计时归零 = 发奖 + 关闭
+//   2. -[AdRewardedVideoView BeeVideoPlayerView:playedTime:] 进度放大 gRate 倍
+//   3. 广告露出 1.2s 自动推进度、3s 补 didFinishPlay，不做强制关闭
+//   4. 「🎯 广告实例」报告：活着的广告视图 + 可调用方法 + BEE 播放器完整方法/属性表
+//   5. 悬浮球菜单加「自动秒过」开关
 //
 // v3 相对 v2 的变化：
 //   1. 诊断改成"全窗口采集"（v2 只抓 keyWindow，结果抓到的是悬浮球自己）
@@ -43,6 +50,8 @@ static void ASRegisterPlayer(AVPlayer *p);
 static void ASBoostPlayerNow(AVPlayer *p);
 static void ASPushRateToWebView(WKWebView *webView);
 static void ASInstallGenericRateHooks(void);
+static int  ASAutoSkipVisibleAds(void);
+static int  ASForceSkipNow(NSMutableString *detail);
 
 static BOOL ASIsAlipay(void) {
     static BOOL result = NO;
@@ -483,7 +492,7 @@ static void ASAdoptWebView(WKWebView *wv) {
     if (!wv) return;
     @synchronized (gWebViews) { [gWebViews addObject:wv]; }
     if (!gAdoptedWebViews) gAdoptedWebViews = [NSMutableSet set];
-    NSString *key = [NSString stringWithFormat:@"%p", (void *)wv];
+    NSString *key = [NSString stringWithFormat:@"%p", (__bridge void *)wv];
     BOOL first = ![gAdoptedWebViews containsObject:key];
     if (first) {
         [gAdoptedWebViews addObject:key];
@@ -595,6 +604,11 @@ static void ASScanOnce(void) {
             }
             gLastAdSnapshot = ASSnapshotOfView(best);
         }
+    }
+
+    // 自动秒过：只在广告真在屏上时动作
+    if (visibleAds.count > 0) {
+        @try { ASAutoSkipVisibleAds(); } @catch (__unused NSException *e) {}
     }
 }
 
@@ -716,12 +730,319 @@ static int ASForceFinishPlayers(NSMutableString *detail) {
     return hit;
 }
 
+#pragma mark - mPaaS BEE 激励视频（支付宝自研广告 SDK）
+
+// 调用链（从「广告类方法」诊断里真实类名反推）：
+//   AdRewardedVideoView  —— 激励视频主视图，同时是 BeeVideoPlayerView 的 delegate
+//     - BeeVideoPlayerView:playedTime:      进度回调，倒计时/进度条按它走
+//     - BeeVideoPlayerView:willChangeState: 播放 / 暂停 / 缓冲状态
+//     - BeeVideoPlayerViewDidFinishPlay:    播放结束
+//     - countDownEnd                        倒计时归零 —— 发奖 + 关闭的真正入口
+//     - closeView / banPlay / continuePlayer: / pausePlayer: / setPlayTime:
+//   AdRewardView —— 外层容器
+//     - countDownFinish / didCloseView / pasueTimer: / resumeTimer:
+//
+// 结论：这家的倒计时跟"视频播到第几秒"无关，只改倍速永远等不到它结束，
+// 必须直接把它推到"倒计时归零"那一步（countDownEnd），才会走发奖 + 关闭。
+
+static NSMutableDictionary<NSString *, NSNumber *> *gAdFirstSeen = nil;
+static NSMutableSet<NSString *> *gAdStepsDone = nil;
+static BOOL gAutoSkip = YES;
+
+static NSString *ASPtrKey(id o) {
+    return [NSString stringWithFormat:@"%p", (__bridge void *)o];
+}
+
+static BOOL ASResponds(id o, NSString *selName) {
+    return o != nil && [o respondsToSelector:NSSelectorFromString(selName)];
+}
+
+// BEE 播放器：激励视频的画面由它渲染，didFinishPlay 需要它做参数
+static UIView *ASFindBeePlayer(UIView *root) {
+    UIView *base = root.window ?: root;
+    __block UIView *found = nil;
+    ASWalkViews(base, 0, ^(UIView *v, int d) {
+        NSString *cn = NSStringFromClass([v class]);
+        if ([cn containsString:@"BeeVideoPlayer"] || [cn containsString:@"BEEVideoPlayer"]) found = v;
+    });
+    return found;
+}
+
+// 只认"能自己结束自己"的视图，避免把 AdVideoModel 这类数据对象算进来
+static BOOL ASIsRewardAdView(id v) {
+    if (![v isKindOfClass:[UIView class]]) return NO;
+    if (ASResponds(v, @"countDownEnd")) return YES;
+    if (ASResponds(v, @"BeeVideoPlayerViewDidFinishPlay:")) return YES;
+    if (ASResponds(v, @"countDownFinish")) return YES;
+    if (ASResponds(v, @"closeView") && ASResponds(v, @"banPlay")) return YES;
+    if (ASResponds(v, @"didCloseView")) return YES;
+    return NO;
+}
+
+// step 0: countDownEnd             倒计时归零（首选，等价于"用户看完了"）
+// step 1: didFinishPlay:           播放结束回调
+// step 2: closeView / didCloseView 兜底关掉（只在手动"秒过"时用，自动模式不碰）
+static int ASRunSkipStep(UIView *v, int step, NSMutableString *log) {
+    if (!v || !v.window || v.hidden || v.alpha < 0.01) return 0;
+    if (!gAdStepsDone) gAdStepsDone = [NSMutableSet set];
+
+    NSString *key = [NSString stringWithFormat:@"%@#%d", ASPtrKey(v), step];
+    if ([gAdStepsDone containsObject:key]) return 0;
+
+    SEL sel = NULL;
+    NSString *what = nil;
+    UIView *player = nil;
+
+    if (step == 0) {
+        if (!ASResponds(v, @"countDownEnd")) return 0;
+        sel = NSSelectorFromString(@"countDownEnd");
+        what = @"countDownEnd";
+    } else if (step == 1) {
+        if (!ASResponds(v, @"BeeVideoPlayerViewDidFinishPlay:")) return 0;
+        player = ASFindBeePlayer(v);
+        if (!player) return 0;   // 没有播放器就别传 nil，免得 SDK 内部判空失败
+        sel = NSSelectorFromString(@"BeeVideoPlayerViewDidFinishPlay:");
+        what = @"BeeVideoPlayerViewDidFinishPlay:";
+    } else {
+        if (ASResponds(v, @"closeView")) {
+            sel = NSSelectorFromString(@"closeView"); what = @"closeView";
+        } else if (ASResponds(v, @"didCloseView")) {
+            sel = NSSelectorFromString(@"didCloseView"); what = @"didCloseView";
+        } else {
+            return 0;
+        }
+    }
+
+    [gAdStepsDone addObject:key];
+    @try {
+        if (player) {
+            ((void (*)(id, SEL, id))objc_msgSend)(v, sel, player);
+            if (log) [log appendFormat:@"→ %@(%@)\n", what, NSStringFromClass([player class])];
+        } else {
+            ((void (*)(id, SEL))objc_msgSend)(v, sel);
+            if (log) [log appendFormat:@"→ %@\n", what];
+        }
+        ASRecord([NSString stringWithFormat:@"秒过 %@ %@", NSStringFromClass([v class]), what]);
+        return 1;
+    } @catch (__unused NSException *e) {
+        if (log) [log appendFormat:@"→ %@ 抛异常，已放弃\n", what];
+        return 0;
+    }
+}
+
+// 由 0.4 秒巡检调用：广告露出 1.2 秒后推进度，3 秒后补一次 didFinishPlay。
+// 不做"强制关闭"，避免真正发奖流程还没跑完就把视图拆了。
+static int ASAutoSkipVisibleAds(void) {
+    if (!gAutoSkip || !ASEngineOn()) return 0;
+    if (!gAdFirstSeen) gAdFirstSeen = [NSMutableDictionary dictionary];
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    NSMutableArray<UIView *> *live = [NSMutableArray array];
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (![v isKindOfClass:[UIView class]]) return;
+            if (!ASIsRewardAdView(v)) return;
+            if (!v.window || v.hidden || v.alpha < 0.01) return;
+            [live addObject:v];
+        });
+    }
+
+    int hit = 0;
+    for (UIView *v in live) {
+        NSString *k = ASPtrKey(v);
+        NSNumber *t0 = gAdFirstSeen[k];
+        if (!t0) {
+            gAdFirstSeen[k] = @(now);
+            ASRecord([NSString stringWithFormat:@"广告露出: %@", NSStringFromClass([v class])]);
+            continue;
+        }
+        NSTimeInterval el = now - t0.doubleValue;
+        if (el >= 1.2) hit += ASRunSkipStep(v, 0, nil);
+        if (el >= 3.0) hit += ASRunSkipStep(v, 1, nil);
+    }
+
+    if (gAdFirstSeen.count > 200) {
+        [gAdFirstSeen removeAllObjects];
+        [gAdStepsDone removeAllObjects];
+    }
+    return hit;
+}
+
+// 手动"秒过"：三级全上，最后退回 AVPlayer 方案
+static int ASForceSkipNow(NSMutableString *detail) {
+    __block int hit = 0;
+    __block int seen = 0;
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (![v isKindOfClass:[UIView class]]) return;
+            if (!ASIsRewardAdView(v)) return;
+            if (!v.window || v.hidden || v.alpha < 0.01) return;
+            seen++;
+            [detail appendFormat:@"%@  %@\n", NSStringFromClass([v class]),
+             NSStringFromCGRect(v.frame)];
+            for (int step = 0; step < 3; step++) {
+                if (ASRunSkipStep(v, step, detail)) hit++;
+            }
+        });
+    }
+
+    if (seen == 0) {
+        [detail appendString:@"没有找到活着的广告视图，退回 AVPlayer 方案：\n"];
+        hit += ASForceFinishPlayers(detail);
+    } else if (hit == 0) {
+        [detail appendString:@"\n广告视图在，但没有一个方法调用成功。\n"];
+        [detail appendString:@"点「🎯 广告实例」把方法/属性列表发我，改精准 hook。\n"];
+    }
+    return hit;
+}
+
+static NSString *ASDumpClassFull(NSString *name) {
+    Class cls = NSClassFromString(name);
+    if (!cls) return [NSString stringWithFormat:@"%@ —— 类不存在\n", name];
+
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"%@\n  image: %@\n  super: %@\n", name, ASImagePath(cls), ASClassChain(cls)];
+
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList(cls, &mc);
+    NSMutableArray *methods = [NSMutableArray array];
+    for (unsigned int i = 0; i < mc; i++) {
+        [methods addObject:[NSString stringWithFormat:@"%s(%s)",
+                            sel_getName(method_getName(ms[i])),
+                            method_getTypeEncoding(ms[i])]];
+    }
+    if (ms) free(ms);
+    [methods sortUsingSelector:@selector(compare:)];
+    [s appendFormat:@"  方法 %u 个:\n    %@\n", mc, [methods componentsJoinedByString:@"\n    "]];
+
+    unsigned int ic = 0;
+    Ivar *ivs = class_copyIvarList(cls, &ic);
+    NSMutableArray *ivars = [NSMutableArray array];
+    for (unsigned int i = 0; i < ic; i++) {
+        [ivars addObject:[NSString stringWithFormat:@"%s : %s",
+                          ivar_getName(ivs[i]), ivar_getTypeEncoding(ivs[i])]];
+    }
+    if (ivs) free(ivs);
+    [s appendFormat:@"  属性 %u 个: %@\n", ic, [ivars componentsJoinedByString:@", "]];
+    return s;
+}
+
+static NSString *ASBuildAdInstanceReport(void) {
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"自动秒过: %@   倍速: %gx\n\n", gAutoSkip ? @"开" : @"关", gRate];
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    __block int n = 0;
+
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (![v isKindOfClass:[UIView class]]) return;
+            if (!ASIsRewardAdView(v)) return;
+            if (!v.window || v.hidden) return;
+
+            n++;
+            NSString *k = ASPtrKey(v);
+            NSNumber *t0 = gAdFirstSeen[k];
+            [out appendFormat:@"#%d %@\n  地址 %@  frame=%@\n  在屏 %.1fs   Lv%.0f %@\n",
+             n, NSStringFromClass([v class]), k, NSStringFromCGRect(v.frame),
+             t0 ? now - t0.doubleValue : 0.0,
+             w.windowLevel, NSStringFromClass([w class])];
+
+            NSMutableArray *can = [NSMutableArray array];
+            NSArray *probe = @[@"countDownEnd", @"BeeVideoPlayerViewDidFinishPlay:",
+                               @"BeeVideoPlayerView:playedTime:", @"closeView",
+                               @"didCloseView", @"countDownFinish", @"banPlay",
+                               @"continuePlayer:", @"pausePlayer:", @"setPlayTime:"];
+            for (NSString *sel in probe) if (ASResponds(v, sel)) [can addObject:sel];
+            [out appendFormat:@"  可调用: %@\n", [can componentsJoinedByString:@", "]];
+
+            UIView *p = ASFindBeePlayer(v);
+            if (p) [out appendFormat:@"  播放器: %@ %@\n",
+                    NSStringFromClass([p class]), NSStringFromCGRect(p.frame)];
+        });
+    }
+
+    if (n == 0) [out appendString:@"(当前没有活着的广告视图)\n"];
+
+    [out appendString:@"\n"];
+    [out appendString:ASDumpClassFull(@"AdRewardedVideoView")];
+    [out appendString:@"\n"];
+    [out appendString:ASDumpClassFull(@"BeeVideoPlayerView")];
+    return out;
+}
+
+#pragma mark - BEE 进度伪造 + 播放器倍速
+
+// -[AdRewardedVideoView BeeVideoPlayerView:playedTime:] 的进度值直接决定倒计时，
+// 把回传的秒数放大，倒计时自然就提前归零，跟真实视频解码无关。
+static IMP gOrigPlayedTimeF = NULL;
+static IMP gOrigPlayedTimeD = NULL;
+
+static void ASMyPlayedTimeF(id self, SEL _cmd, id player, float t) {
+    IMP orig = gOrigPlayedTimeF;
+    if (!orig) return;
+    float out = (ASEngineOn() && t > 0.0f) ? t * gRate : t;
+    ((void (*)(id, SEL, id, float))orig)(self, _cmd, player, out);
+}
+
+static void ASMyPlayedTimeD(id self, SEL _cmd, id player, double t) {
+    IMP orig = gOrigPlayedTimeD;
+    if (!orig) return;
+    double out = (ASEngineOn() && t > 0.0) ? t * (double)gRate : t;
+    ((void (*)(id, SEL, id, double))orig)(self, _cmd, player, out);
+}
+
+// 取第 nth 个类型字符（1=返回值 2=self 3=_cmd 4=第一个参数 5=第二个参数）
+static char ASNthArgType(const char *enc, int nth) {
+    if (!enc) return 0;
+    const char *c = enc;
+    int idx = 0;
+    while (*c) {
+        while (*c >= '0' && *c <= '9') c++;
+        if (!*c) break;
+        char t = *c++;
+        if (t == '^' || t == 'r' || t == 'n' || t == 'N' ||
+            t == 'o' || t == 'O' || t == 'R' || t == 'V') continue;
+        idx++;
+        if (idx == nth) return t;
+    }
+    return 0;
+}
+
+static void ASInstallBeeHooks(void) {
+    Class cls = NSClassFromString(@"AdRewardedVideoView");
+    if (!cls) return;
+
+    SEL sel = NSSelectorFromString(@"BeeVideoPlayerView:playedTime:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m || gOrigPlayedTimeF || gOrigPlayedTimeD) return;
+
+    char t = ASNthArgType(method_getTypeEncoding(m), 5);
+    IMP orig = method_getImplementation(m);
+    if (t == 'f') {
+        gOrigPlayedTimeF = orig;
+        method_setImplementation(m, (IMP)ASMyPlayedTimeF);
+    } else if (t == 'd') {
+        gOrigPlayedTimeD = orig;
+        method_setImplementation(m, (IMP)ASMyPlayedTimeD);
+    } else {
+        return;
+    }
+    ASRecord([NSString stringWithFormat:@"BEE playedTime hook 挂上（%c 型参数）", t]);
+}
+
 #pragma mark - 诊断报告
 
 static NSString *ASBuildInterfaceReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"AdSpeeder 诊断 v3\n倍速: %gx (%@)   通用hook: %lu   计时器压缩: %d\n\n",
-     gRate, ASEngineOn() ? @"开" : @"关", (unsigned long)gGenHooked.count, gTimerHits];
+    [out appendFormat:@"AdSpeeder 诊断 v4\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
+     gRate, ASEngineOn() ? @"开" : @"关", gAutoSkip ? @"开" : @"关",
+     (unsigned long)gGenHooked.count, gTimerHits];
 
     if (gLastAdSnapshot.length) {
         [out appendFormat:@"== 最近抓到的广告视图 ==\n%@\n\n", gLastAdSnapshot];
@@ -995,12 +1316,26 @@ static void ASSetRate(float rate, BOOL persist) {
         }]];
     }
 
+    [sheet addAction:[UIAlertAction actionWithTitle:(gAutoSkip ? @"✅ 自动秒过：开" : @"⬜️ 自动秒过：关")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        gAutoSkip = !gAutoSkip;
+        ASRecord([NSString stringWithFormat:@"自动秒过 %@", gAutoSkip ? @"开" : @"关"]);
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ 秒过当前广告" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSMutableString *detail = [NSMutableString string];
-        (void)ASForceFinishPlayers(detail);
+        (void)ASForceSkipNow(detail);
         ASDiagController *vc = [[ASDiagController alloc] init];
         vc.heading = @"秒过结果";
         vc.body = detail.length ? detail : @"(无输出)";
+        [root presentViewController:vc animated:YES completion:nil];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"🎯 广告实例" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        ASDiagController *vc = [[ASDiagController alloc] init];
+        vc.heading = @"广告实例 / BEE 播放器";
+        vc.body = ASBuildAdInstanceReport();
         [root presentViewController:vc animated:YES completion:nil];
     }]];
 
@@ -1132,16 +1467,17 @@ static void AdSpeederInit(void) {
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v3 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx)",
+    NSLog(@"[AdSpeeder] v4 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
-          gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate);
+          gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
 
-    // 通用倍速 hook：模块可能在启动后才加载，分几轮补
+    // 通用倍速 hook + BEE 广告 hook：模块可能在启动后才加载，分几轮补
     for (NSNumber *delay in @[@0.5, @2.0, @5.0, @10.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @try { ASInstallGenericRateHooks(); } @catch (__unused NSException *e) {}
+            @try { ASInstallBeeHooks(); } @catch (__unused NSException *e) {}
         });
     }
 
