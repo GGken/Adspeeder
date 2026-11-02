@@ -1,5 +1,13 @@
-// AdSpeeder v6 - Alipay mini-game rewarded-video ad accelerator
+// AdSpeeder v7 - Alipay mini-game rewarded-video ad accelerator
 // 纯 objc runtime swizzling，不带 substrate / logos 依赖，TrollFools 注入可加载。
+//
+// v7：日志证明"跳片尾"确实生效（广告 1.5s 内就关），但奖励可能仍被 JS 侧判定为未完成
+//   1. JS 层接管 my.createRewardedAd：记录 onClose 回调，可直通 isEnded=true（菜单开关）
+//   2. 新增 WKScriptMessageHandler「aslog」，JS 侧日志直接进事件记录
+//   3. hook +[UIAlertController alertControllerWithTitle:message:] 抓弹窗文案
+//      —— "未完成观看" 还是 "奖励已发放"，一行字就能定论
+//   4. 设完倍速读回当前值，报告"生效/被拒"，确认 setPlaybackRate: 这枪打没打中
+//   5. 「自动跳片尾」独立开关：关掉后只靠倍速自然播完，看会不会更容易发奖
 //
 // v6：时间线实测广告是 BeeVideoPlayerView（小程序视频组件），不是 Ad* 那套
 //   1. 新增 ASDriveBeePlayers：每 0.4s 对在屏 Bee 播放器补倍速
@@ -45,6 +53,13 @@ static NSString *const kPrefEnabled = @"adspeeder.enabled";
 static NSString *const kPrefRate    = @"adspeeder.rate";
 static NSString *const kPrefPosX    = @"adspeeder.x";
 static NSString *const kPrefPosY    = @"adspeeder.y";
+static NSString *const kPrefSeek    = @"adspeeder.seek";      // 自动跳片尾
+static NSString *const kPrefFakeAd  = @"adspeeder.fakead";    // JS 侧直通广告回调
+
+// 自动跳片尾：实测有效（广告 1.5 秒内就关），默认开
+static BOOL gSeekToEnd = YES;
+// JS 侧直通：拦截 my.createRewardedAd，让 onClose 直接回"看完了"
+static BOOL gFakeAd = NO;
 
 static float gRate = 16.0f;                     // 0 = 关闭
 static NSHashTable<WKWebView *> *gWebViews = nil;
@@ -129,12 +144,16 @@ static void ASLoadPrefs(void) {
         if (r < 2.0f) r = 16.0f;
         gRate = on ? r : 0.0f;
     }
+    if ([d objectForKey:kPrefSeek] != nil) gSeekToEnd = [d boolForKey:kPrefSeek];
+    if ([d objectForKey:kPrefFakeAd] != nil) gFakeAd = [d boolForKey:kPrefFakeAd];
 }
 
 static void ASSavePrefs(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     [d setBool:ASEngineOn() forKey:kPrefEnabled];
     [d setFloat:(ASEngineOn() ? gRate : 16.0f) forKey:kPrefRate];
+    [d setBool:gSeekToEnd forKey:kPrefSeek];
+    [d setBool:gFakeAd forKey:kPrefFakeAd];
     [d synchronize];
 }
 
@@ -493,13 +512,79 @@ static NSString *const kBoostJS =
  "try{new MutationObserver(s).observe(document.documentElement,{childList:!0,subtree:!0});}catch(e){}"
  "s();})();";
 
+// 小程序/小游戏里的激励视频走 my.createRewardedAd，奖励判定在 JS 的 onClose(isEnded)。
+// 原生把视频跳完并不能让它认为"看完了"，所以这里在 JS 层接管这个 API：
+//   1) 记下游戏注册的 onClose 回调
+//   2) window.__asFakeAd 为真时，show() 之后直接回 isEnded=true，原生广告根本不播
+static NSString *const kAdShimJS =
+@"(function(){"
+ "if(window.__asAdShim)return;window.__asAdShim=1;"
+ "function log(m){try{window.webkit.messageHandlers.aslog.postMessage('[JS] '+m);}catch(e){}}"
+ "function targets(){var a=[];try{if(window.my)a.push(window.my);}catch(e){}"
+ "try{if(window.antgame){a.push(window.antgame);if(window.antgame.ad)a.push(window.antgame.ad);"
+ "if(window.antgame.my)a.push(window.antgame.my);}}catch(e){}"
+ "try{if(window.ap&&window.ap.my)a.push(window.ap.my);}catch(e){}return a;}"
+ "var KNOWN=['createRewardedAd','createRewardedVideoAd','createInterstitialAd'];"
+ "function hook(ad,src){if(!ad)return;var k='__asHooked';try{if(ad[k])return;ad[k]=1;}catch(e){return;}"
+ "var oc=null;try{oc=ad.onClose;}catch(e){}"
+ "try{ad.onClose=function(cb){window.__asAdCloseCb=cb;log('onClose 注册('+src+')');"
+ "return oc?oc.call(ad,cb):undefined;};}catch(e){log('onClose 接管失败 '+e);}"
+ "var os=null;try{os=ad.show;}catch(e){}"
+ "try{ad.show=function(){var fake=!!window.__asFakeAd;log('show() fake='+(fake?1:0)+' ('+src+')');"
+ "if(fake){setTimeout(function(){var cb=window.__asAdCloseCb;"
+ "log('直接回 onClose isEnded=true cb='+(cb?'有':'无'));"
+ "try{if(cb)cb({isEnded:true,count:1,completed:true,reward:true});}catch(e){log('cb 抛错 '+e);}},800);"
+ "try{return Promise.resolve();}catch(e){return;}}"
+ "return os?os.apply(ad,arguments):undefined;};}catch(e){log('show 接管失败 '+e);}"
+ "var ol=null;try{ol=ad.load;}catch(e){}"
+ "try{ad.load=function(){var r=null;try{r=ol?ol.apply(ad,arguments):null;}catch(e){}"
+ "return (r&&r.then)?r:Promise.resolve();};}catch(e){}}"
+ "var tries=0;"
+ "function scan(){var t=targets(),n=0;"
+ "for(var i=0;i<t.length;i++){var o=t[i];if(!o)continue;"
+ "for(var j=0;j<KNOWN.length;j++){var name=KNOWN[j],f=null;"
+ "try{f=o[name];}catch(e){}if(typeof f!=='function')continue;"
+ "if(o['__as_wrapped_'+name])continue;"
+ "try{(function(obj,nm,orig){var w=function(){var ad=null;"
+ "try{ad=orig.apply(obj,arguments);}catch(e){log('调用 '+nm+' 抛错 '+e);return null;}"
+ "try{hook(ad,nm);}catch(e){}return ad;};obj[nm]=w;"
+ "if(obj[nm]===w){obj['__as_wrapped_'+nm]=1;log('已接管 '+nm);n++;}"
+ "else log('接管失败(只读) '+nm);})(o,name,f);}catch(e){log('接管失败 '+name+' '+e);}}}"
+ "if(n===0){if(++tries<40)setTimeout(scan,250);"
+ "else log('没找到广告 API（my='+(typeof window.my)+'）');}}"
+ "scan();})();";
+
 static IMP gOrigInitWithFrameConfig = NULL;
+
+@interface ASJSBridge : NSObject <WKScriptMessageHandler>
+@end
+
+@implementation ASJSBridge
+- (void)userContentController:(WKUserContentController *)ucc didReceiveScriptMessage:(WKScriptMessage *)message {
+    NSString *body = nil;
+    @try { if (message.body) body = [NSString stringWithFormat:@"%@", message.body]; }
+    @catch (__unused NSException *e) {}
+    if (body.length) ASRecord(body);
+}
+@end
+
+static ASJSBridge *gBridge = nil;
 
 static float gPushedRate = -1.0f;   // 上次推给 JS 的倍速，避免每 0.4 秒重复 eval
 
+static void ASPushFakeAdToWebViews(void) {
+    NSArray *snapshot = nil;
+    @synchronized (gWebViews) { snapshot = gWebViews.allObjects; }
+    NSString *js = [NSString stringWithFormat:@"window.__asFakeAd=%@;", gFakeAd ? @"true" : @"false"];
+    for (WKWebView *w in snapshot) {
+        @try { [w evaluateJavaScript:js completionHandler:nil]; } @catch (__unused NSException *e) {}
+    }
+}
+
 static void ASPushRateToWebView(WKWebView *webView) {
     if (!webView) return;
-    NSString *js = [NSString stringWithFormat:@"window.__asRate=%g;", gRate];
+    NSString *js = [NSString stringWithFormat:@"window.__asRate=%g;window.__asFakeAd=%@;",
+                    gRate, gFakeAd ? @"true" : @"false"];
     @try { [webView evaluateJavaScript:js completionHandler:nil]; } @catch (__unused NSException *e) {}
     gPushedRate = gRate;
 }
@@ -513,8 +598,10 @@ static void ASAdoptWebView(WKWebView *wv) {
     if (first) {
         [gAdoptedWebViews addObject:key];
         @try {
-            NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;", gRate];
+            NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;window.__asFakeAd=%@;",
+                              gRate, gFakeAd ? @"true" : @"false"];
             [wv evaluateJavaScript:seed completionHandler:nil];
+            [wv evaluateJavaScript:kAdShimJS completionHandler:nil];
             [wv evaluateJavaScript:kBoostJS completionHandler:nil];
         } @catch (__unused NSException *e) {}
         ASPushRateToWebView(wv);
@@ -530,8 +617,15 @@ static id ASMyInitWithFrameConfig(WKWebView *self, SEL _cmd, CGRect frame, WKWeb
             ucc = [[WKUserContentController alloc] init];
             config.userContentController = ucc;
         }
-        NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;", gRate];
+        if (!gBridge) gBridge = [[ASJSBridge alloc] init];
+        @try { [ucc addScriptMessageHandler:gBridge name:@"aslog"]; }
+        @catch (__unused NSException *e) {}
+        NSString *seed = [NSString stringWithFormat:@"window.__asRate=%g;window.__asFakeAd=%@;",
+                          gRate, gFakeAd ? @"true" : @"false"];
         [ucc addUserScript:[[WKUserScript alloc] initWithSource:seed
+                                                    injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                 forMainFrameOnly:NO]];
+        [ucc addUserScript:[[WKUserScript alloc] initWithSource:kAdShimJS
                                                     injectionTime:WKUserScriptInjectionTimeAtDocumentStart
                                                  forMainFrameOnly:NO]];
         [ucc addUserScript:[[WKUserScript alloc] initWithSource:kBoostJS
@@ -553,6 +647,21 @@ static void ASMyPresent(UIViewController *self, SEL _cmd, UIViewController *vc, 
                   NSStringFromClass([self class]), NSStringFromClass([vc class])]);
     } @catch (__unused NSException *e) {}
     ((void (*)(id, SEL, id, BOOL, id))gOrigPresent)(self, _cmd, vc, animated, completion);
+}
+
+// 弹出框的标题/正文往往直接写着"未完成观看"或"奖励已发放"，
+// 这是判断奖励到底给没给的最直接证据，所以单独记一条。
+static id (*gOrigAlert)(id, SEL, NSString *, NSString *, NSInteger) = NULL;
+
+static id ASMyAlert(id self, SEL _cmd, NSString *title, NSString *message, NSInteger style) {
+    if (!gOrigAlert) return nil;
+    @try {
+        if (![title isEqualToString:@"AdSpeeder"]) {
+            ASRecord([NSString stringWithFormat:@"[弹窗文案] %@ | %@",
+                      title.length ? title : @"(无标题)", message ?: @""]);
+        }
+    } @catch (__unused NSException *e) {}
+    return gOrigAlert(self, _cmd, title, message, style);
 }
 
 #pragma mark - 广告巡检（自动抓，不用卡时间）
@@ -1306,13 +1415,29 @@ static void ASDriveBeePlayers(void) {
             if (!set) set = ASCallVoidDouble(p, @"setPlaybackRate:", gRate);
             if (!set) set = ASCallVoidDouble(p, @"setSpeed:", gRate);
             if (!set) set = ASCallVoidDouble(p, @"playAtRate:", gRate);
+
+            // 只报一次：设完读回来，看倍速到底吃进去没有
+            NSString *kr = [key stringByAppendingString:@"#rate"];
+            if (![gAdStepsDone containsObject:kr]) {
+                [gAdStepsDone addObject:kr];
+                double back = -1;
+                if (ASCallDouble(p, @"playbackRate", &back) ||
+                    ASCallDouble(p, @"rate", &back) ||
+                    ASCallDouble(p, @"speed", &back)) {
+                    ASRecord([NSString stringWithFormat:@"BEE 倍速 设定%gx → 实际%.2fx %@",
+                              gRate, back, (back > 1.05 ? @"生效" : @"被拒/无效")]);
+                } else {
+                    ASRecord([NSString stringWithFormat:@"BEE 倍速 设定%gx，但读不到当前值（%@）",
+                              gRate, set ? @"已调用" : @"无可用 setter"]);
+                }
+            }
         } @catch (__unused NSException *e) {}
 
         double dur = ASBeePlayerDuration(p);
 
-        // +1.2s：直接把进度怼到片尾，让它自己触发 finished
+        // +1.2s：直接把进度怼到片尾，让它自己触发 finished（可在菜单里关掉）
         NSString *k1 = [key stringByAppendingString:@"#seek1"];
-        if (el >= 1.2 && ![gAdStepsDone containsObject:k1]) {
+        if (gSeekToEnd && el >= 1.2 && ![gAdStepsDone containsObject:k1]) {
             [gAdStepsDone addObject:k1];
             double target = dur > 0 ? dur : 9999.0;
             BOOL ok = ASCallVoidDouble(p, @"seekToTime:", target);
@@ -1362,8 +1487,9 @@ static void ASDriveBeePlayers(void) {
 
 static NSString *ASBuildInterfaceReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"AdSpeeder 诊断 v6\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
+    [out appendFormat:@"AdSpeeder 诊断 v7\n倍速: %gx (%@)   自动秒过: %@   跳片尾: %@   直通: %@   通用hook: %lu   计时器压缩: %d\n\n",
      gRate, ASEngineOn() ? @"开" : @"关", gAutoSkip ? @"开" : @"关",
+     gSeekToEnd ? @"开" : @"关", gFakeAd ? @"开" : @"关",
      (unsigned long)gGenHooked.count, gTimerHits];
 
     if (gLastAdSnapshot.length) {
@@ -1676,7 +1802,25 @@ static void ASSetRate(float rate, BOOL persist) {
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
         gAutoSkip = !gAutoSkip;
+        ASSavePrefs();
         ASRecord([NSString stringWithFormat:@"自动秒过 %@", gAutoSkip ? @"开" : @"关"]);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(gSeekToEnd ? @"⏭ 自动跳片尾：开" : @"⏭ 自动跳片尾：关")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        gSeekToEnd = !gSeekToEnd;
+        ASSavePrefs();
+        ASRecord([NSString stringWithFormat:@"自动跳片尾 %@", gSeekToEnd ? @"开" : @"关"]);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:(gFakeAd ? @"🎮 直通广告回调：开" : @"🎮 直通广告回调：关")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        gFakeAd = !gFakeAd;
+        ASSavePrefs();
+        ASPushFakeAdToWebViews();
+        ASRecord([NSString stringWithFormat:@"JS 直通广告回调 %@（下次点广告生效）", gFakeAd ? @"开" : @"关"]);
     }]];
 
     [sheet addAction:[UIAlertAction actionWithTitle:@"⚡ 秒过当前广告" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1826,11 +1970,18 @@ static void AdSpeederInit(void) {
                   (IMP)ASMyPresent, &gOrigPresent);
     }
 
+    Class alertCls = objc_getClass("UIAlertController");
+    if (alertCls) {
+        ASSwizzleClass(object_getClass(alertCls),
+                       @selector(alertControllerWithTitle:message:preferredStyle:),
+                       (IMP)ASMyAlert, (IMP *)&gOrigAlert);
+    }
+
     ASStartRateWatchdog();
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v6 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
+    NSLog(@"[AdSpeeder] v7 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
           gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
