@@ -1,5 +1,11 @@
-// AdSpeeder v5 - Alipay mini-game rewarded-video ad accelerator
+// AdSpeeder v6 - Alipay mini-game rewarded-video ad accelerator
 // 纯 objc runtime swizzling，不带 substrate / logos 依赖，TrollFools 注入可加载。
+//
+// v6：时间线实测广告是 BeeVideoPlayerView（小程序视频组件），不是 Ad* 那套
+//   1. 新增 ASDriveBeePlayers：每 0.4s 对在屏 Bee 播放器补倍速
+//   2. +1.2s seekToTime:duration 跳片尾、+2.6s 二次推、+3.6s 给 delegate 模拟 BeeVideoPlayerFinished
+//   3. 播放器第一次出现时把它"可用的 API"打进事件记录（有没有 setRate:/seekToTime:）
+//   4. 🎯 广告实例报告增加"在屏 BEE 播放器"段：类名、frame、时长、可用方法
 //
 // v5：
 //   1. 「🧾 视图时间线」：窗口里新冒出来的 Ad*/video/player/webview 自动留痕，
@@ -59,6 +65,9 @@ static void ASPushRateToWebView(WKWebView *webView);
 static void ASInstallGenericRateHooks(void);
 static int  ASAutoSkipVisibleAds(void);
 static int  ASForceSkipNow(NSMutableString *detail);
+static void ASDriveBeePlayers(void);
+static NSString *ASProbeBeePlayer(id p);
+static double ASBeePlayerDuration(id p);
 
 static BOOL ASIsAlipay(void) {
     static BOOL result = NO;
@@ -697,6 +706,9 @@ static void ASScanOnce(void) {
 
     // 自动秒过：自己会再扫一遍，不依赖上面的广告视图判定
     @try { ASAutoSkipVisibleAds(); } @catch (__unused NSException *e) {}
+
+    // 小程序视频组件（BeeVideoPlayerView）这条路单独驱动
+    @try { ASDriveBeePlayers(); } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - 广告倒计时压缩
@@ -1079,6 +1091,22 @@ static NSString *ASBuildAdInstanceReport(void) {
 
     if (n == 0) [out appendString:@"(当前没有活着的广告视图)\n"];
 
+    // 时间线证明广告走的是小程序视频组件，这条单独列，没有 Ad* 视图时也能看到
+    NSMutableArray<UIView *> *bees = [NSMutableArray array];
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (!v.window || v.hidden) return;
+            if ([NSStringFromClass([v class]) containsString:@"BeeVideoPlayer"]) [bees addObject:v];
+        });
+    }
+    [out appendFormat:@"\n== 在屏 BEE 播放器 %lu 个 ==\n", (unsigned long)bees.count];
+    for (UIView *p in bees) {
+        double d = ASBeePlayerDuration(p);
+        [out appendFormat:@"%@  %@  时长 %.1fs\n  可用: %@\n",
+         NSStringFromClass([p class]), NSStringFromCGRect(p.frame), d, ASProbeBeePlayer(p)];
+    }
+
     [out appendString:@"\n"];
     [out appendString:ASDumpClassFull(@"AdRewardedVideoView")];
     [out appendString:@"\n"];
@@ -1173,11 +1201,168 @@ static void ASInstallBeeHooks(void) {
     ASRecord([NSString stringWithFormat:@"BEE playedTime hook 挂上（%c 型参数）", t]);
 }
 
+#pragma mark - BEE 播放器直驱（时间线证明广告走的是这条）
+
+// 时间线实测：激励视频出现时是
+//   BeeVideoPlayerView 390x844
+//     ├ MFCorePlayerView            ← 真正解码渲染的引擎视图
+//     ├ BeeVideoTouchesPlugin / StuckDetect / Poster / Watermark
+//     └ BeeVideoPlayerToolBar / BeeVideoSlider
+// 全程没有 AdRewardedVideoView —— 说明这是小程序自己的视频组件，
+// 奖励靠播放器的"播完"回调往 JS 层发。所以只能对它本人下手：
+// 改倍速 + 把进度直接怼到片尾，让它自己触发 finished。
+
+static BOOL ASCallVoidDouble(id obj, NSString *selName, double v) {
+    if (!obj) return NO;
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return NO;
+    Method m = class_getInstanceMethod([obj class], s);
+    if (!m) return NO;
+    char t = ASNthArgType(method_getTypeEncoding(m), 4);
+    @try {
+        if (t == 'f') { ((void (*)(id, SEL, float))objc_msgSend)(obj, s, (float)v); return YES; }
+        if (t == 'd') { ((void (*)(id, SEL, double))objc_msgSend)(obj, s, v); return YES; }
+        if (t == 'q') { ((void (*)(id, SEL, long long))objc_msgSend)(obj, s, (long long)v); return YES; }
+        if (t == 'i') { ((void (*)(id, SEL, int))objc_msgSend)(obj, s, (int)v); return YES; }
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
+static id ASCallObject(id obj, NSString *selName) {
+    if (!obj) return nil;
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    @try { return ((id (*)(id, SEL))objc_msgSend)(obj, s); }
+    @catch (__unused NSException *e) { return nil; }
+}
+
+static BOOL ASCallDouble(id obj, NSString *selName, double *out) {
+    if (!obj) return NO;
+    SEL s = NSSelectorFromString(selName);
+    if (![obj respondsToSelector:s]) return NO;
+    Method m = class_getInstanceMethod([obj class], s);
+    if (!m) return NO;
+    char t = ASNthArgType(method_getTypeEncoding(m), 1);
+    @try {
+        if (t == 'd') { *out = ((double (*)(id, SEL))objc_msgSend)(obj, s); return YES; }
+        if (t == 'f') { *out = ((float (*)(id, SEL))objc_msgSend)(obj, s); return YES; }
+        if (t == 'q') { *out = (double)((long long (*)(id, SEL))objc_msgSend)(obj, s); return YES; }
+        if (t == 'i') { *out = (double)((int (*)(id, SEL))objc_msgSend)(obj, s); return YES; }
+    } @catch (__unused NSException *e) {}
+    return NO;
+}
+
+// 把播放器上"能用的 API"列出来，一次就能看清该走哪条路
+static NSString *ASProbeBeePlayer(id p) {
+    NSArray *sels = @[@"setRate:", @"rate", @"setPlaybackRate:", @"playbackRate",
+                      @"setSpeed:", @"speed", @"playAtRate:", @"seekToTime:",
+                      @"seekToTime:completion:", @"seekToTime:toleranceBefore:toleranceAfter:",
+                      @"currentPosition", @"duration", @"maxPosition", @"getCurrentTime",
+                      @"play", @"pause", @"innerPlay", @"innerStop", @"isPlaying"];
+    NSMutableArray *hit = [NSMutableArray array];
+    for (NSString *s in sels) if ([p respondsToSelector:NSSelectorFromString(s)]) [hit addObject:s];
+    return [hit componentsJoinedByString:@", "];
+}
+
+// 返回播放器时长（拿不到返回 0）
+static double ASBeePlayerDuration(id p) {
+    double d = 0;
+    if (ASCallDouble(p, @"duration", &d) && d > 0.05) return d;
+    if (ASCallDouble(p, @"maxPosition", &d) && d > 0.05) return d;
+    return 0;
+}
+
+static void ASDriveBeePlayers(void) {
+    if (!ASEngineOn()) return;
+    if (!gAdFirstSeen) gAdFirstSeen = [NSMutableDictionary dictionary];
+    if (!gAdStepsDone) gAdStepsDone = [NSMutableSet set];
+
+    NSMutableArray<UIView *> *players = [NSMutableArray array];
+    for (UIWindow *w in ASAllWindows()) {
+        if (ASIsOwnWindow(w)) continue;
+        ASWalkViews(w, 0, ^(UIView *v, int d) {
+            if (!v.window || v.hidden || v.alpha < 0.01) return;
+            NSString *cn = NSStringFromClass([v class]);
+            if ([cn containsString:@"BeeVideoPlayer"]) [players addObject:v];
+        });
+    }
+    if (players.count == 0) return;
+
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+
+    for (UIView *p in players) {
+        NSString *key = ASPtrKey(p);
+        NSNumber *t0 = gAdFirstSeen[key];
+        if (!t0) {
+            gAdFirstSeen[key] = @(now);
+            ASRecord([NSString stringWithFormat:@"BEE 播放器出现  %@", ASProbeBeePlayer(p)]);
+            continue;
+        }
+        double el = now - t0.doubleValue;
+
+        // 每一轮都补一次倍速：SDK 常把自己被改过的 rate 拨回 1.0
+        @try {
+            BOOL set = ASCallVoidDouble(p, @"setRate:", gRate);
+            if (!set) set = ASCallVoidDouble(p, @"setPlaybackRate:", gRate);
+            if (!set) set = ASCallVoidDouble(p, @"setSpeed:", gRate);
+            if (!set) set = ASCallVoidDouble(p, @"playAtRate:", gRate);
+        } @catch (__unused NSException *e) {}
+
+        double dur = ASBeePlayerDuration(p);
+
+        // +1.2s：直接把进度怼到片尾，让它自己触发 finished
+        NSString *k1 = [key stringByAppendingString:@"#seek1"];
+        if (el >= 1.2 && ![gAdStepsDone containsObject:k1]) {
+            [gAdStepsDone addObject:k1];
+            double target = dur > 0 ? dur : 9999.0;
+            BOOL ok = ASCallVoidDouble(p, @"seekToTime:", target);
+            if (ok) ASRecord([NSString stringWithFormat:@"BEE 跳片尾 %.1fs（时长 %.1fs）", target, dur]);
+            else ASRecord(@"BEE seekToTime: 不可用");
+        }
+
+        // +2.6s：还没结束就再推一次（越过片尾一点，逼出完成回调）
+        NSString *k2 = [key stringByAppendingString:@"#seek2"];
+        if (el >= 2.6 && ![gAdStepsDone containsObject:k2]) {
+            [gAdStepsDone addObject:k2];
+            double target = dur > 0 ? dur + 1.0 : 9999.0;
+            if (ASCallVoidDouble(p, @"seekToTime:", target)) {
+                ASRecord([NSString stringWithFormat:@"BEE 二次跳片尾 %.1fs", target]);
+            }
+        }
+
+        // +3.6s：seek 不管用就直接冒充播放器，给它的 delegate 发"播完了"
+        NSString *k3 = [key stringByAppendingString:@"#finish"];
+        if (el >= 3.6 && ![gAdStepsDone containsObject:k3]) {
+            [gAdStepsDone addObject:k3];
+            id dg = ASCallObject(p, @"delegate");
+            if (!dg) dg = ASCallObject(p, @"videoPlayerDelegate");
+            if (!dg) {
+                ASRecord(@"BEE 拿不到 delegate，跳过模拟结束");
+            } else {
+                NSString *dn = NSStringFromClass([dg class]);
+                BOOL sent = NO;
+                SEL fin = NSSelectorFromString(@"BeeVideoPlayerFinished");
+                if ([dg respondsToSelector:fin]) {
+                    @try { ((void (*)(id, SEL))objc_msgSend)(dg, fin); sent = YES; } @catch (__unused NSException *e) {}
+                }
+                SEL pt = NSSelectorFromString(@"BeeVideoPlayerPlayedTime:");
+                if ([dg respondsToSelector:pt]) {
+                    @try {
+                        ((void (*)(id, SEL, double))objc_msgSend)(dg, pt, dur > 0 ? dur : 9999.0);
+                        sent = YES;
+                    } @catch (__unused NSException *e) {}
+                }
+                ASRecord([NSString stringWithFormat:@"BEE 模拟结束 → %@ %@", dn, sent ? @"已发送" : @"delegate 无对应方法"]);
+            }
+        }
+    }
+}
+
 #pragma mark - 诊断报告
 
 static NSString *ASBuildInterfaceReport(void) {
     NSMutableString *out = [NSMutableString string];
-    [out appendFormat:@"AdSpeeder 诊断 v5\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
+    [out appendFormat:@"AdSpeeder 诊断 v6\n倍速: %gx (%@)   自动秒过: %@   通用hook: %lu   计时器压缩: %d\n\n",
      gRate, ASEngineOn() ? @"开" : @"关", gAutoSkip ? @"开" : @"关",
      (unsigned long)gGenHooked.count, gTimerHits];
 
@@ -1645,7 +1830,7 @@ static void AdSpeederInit(void) {
     ASStartAdMonitor();
     ASInstallTimerHooks();
 
-    NSLog(@"[AdSpeeder] v5 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
+    NSLog(@"[AdSpeeder] v6 installed (setRate=%d, play=%d, atRate=%d, setRateTime=%d, pvc=%d, wk=%d, present=%d, rate=%gx, autoSkip=%d)",
           gOrigSetRate != NULL, gOrigPlay != NULL, gOrigPlayAtRate != NULL,
           gOrigSetRateTime != NULL, gOrigSetPVPlayer != NULL,
           gOrigInitWithFrameConfig != NULL, gOrigPresent != NULL, gRate, (int)gAutoSkip);
