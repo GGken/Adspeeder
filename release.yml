@@ -1,0 +1,60 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dylib:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Theos
+        run: |
+          brew install ldid xz make
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Read version
+        id: ver
+        run: |
+          V=$(grep '^Version:' control | awk '{print $2}')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: |
+          set -o pipefail
+          make -j4 2>&1 | tee build.log
+          mkdir -p dist
+          find . -name "AdSpeeder.dylib" -type f -exec cp {} dist/ \;
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AdSpeeder-dylib
+          path: dist/AdSpeeder.dylib
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AdSpeeder.dylib
+          generate_release_notes: true
+          body: |
+            AdSpeeder ${{ steps.ver.outputs.version }}
+
+            安装：TrollFools 注入支付宝（`com.alipay.iphoneclient`），**换版前先删旧注入**，
+            然后杀掉支付宝进程重开。
+
+            校验：日志里出现 `[JS] 直接回 onClose isEnded=true cb=有` 即为生效。
+
+            仅用于学习研究，详见 README 的免责声明。
