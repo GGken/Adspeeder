@@ -1,8 +1,27 @@
 name: build
 
+# 什么时候跑：
+#   1) 改动源码（.m / Makefile / control / plist）—— 帮你确认能编译
+#   2) 手动点 Run workflow
+# 纯文档、图片、License 的提交不会触发，避免每次改 README 都跑一遍 macOS 构建。
 on:
   push:
+    paths:
+      - '**/*.m'
+      - '**/*.h'
+      - '**/*.mm'
+      - '**/*.x'
+      - 'Makefile'
+      - 'control'
+      - '*.plist'
+      - 'theos/**'
+      - '.github/workflows/build.yml'
   workflow_dispatch:
+
+# 同一个分支连续 push 时，取消上一次还没跑完的构建，只留最新的
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   dylib:
@@ -19,10 +38,24 @@ jobs:
 
       - name: Build
         run: |
-          make -j4
+          set -o pipefail
+          make -j4 2>&1 | tee build.log || {
+            echo "----- build failed, last lines -----"
+            MSG=$(tail -n 15 build.log | awk '{printf "%s%%0A", $0}')
+            echo "::error title=compile failed::${MSG}"
+            exit 1
+          }
           mkdir -p dist
           find . -name "AdSpeeder.dylib" -type f -print -exec cp {} dist/ \;
           ls -l dist
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
