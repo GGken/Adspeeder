@@ -1,8 +1,8 @@
 Package: com.local.adspeeder
 Name: AdSpeeder
-Version: 0.1.0
+Version: 0.4.0
 Architecture: iphoneos-arm64
-Description: Accelerate rewarded-video and H5 ads inside Alipay mini games
+Description: Skip rewarded-video playback inside Alipay mini games (research only)
 Maintainer: local
 Author: local
 Section: Tweaks
