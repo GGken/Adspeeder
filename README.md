@@ -9,6 +9,13 @@
 > 免费、开源、无网络请求、无上报 —— 除了本仓库代码，不会把任何数据发出去。
 
 [![build](https://github.com/GGken/Adspeeder/actions/workflows/build.yml/badge.svg)](https://github.com/GGken/Adspeeder/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/GGken/Adspeeder?label=release)](https://github.com/GGken/Adspeeder/releases/latest)
+
+## 下载
+
+**[AdSpeeder.dylib](https://github.com/GGken/Adspeeder/releases/latest/download/AdSpeeder.dylib)** —— 约 100 KB，arm64，iOS 15+，不需要登录 GitHub。
+
+历史版本在 [Releases](https://github.com/GGken/Adspeeder/releases)；想自己编译见「四、编译」。
 
 ---
 
